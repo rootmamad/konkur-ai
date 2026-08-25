@@ -37,8 +37,9 @@ export class User {
   lastName: string;
 
   @Prop({
-    required: true,
-  })
+  required: true,
+  select: false,
+})
   passwordHash: string;
 
   @Prop({
@@ -70,6 +71,8 @@ export class User {
     min: 0,
   })
   streak: number;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
 export const UserSchema = SchemaFactory.createForClass(User);
