@@ -10,7 +10,7 @@ import {
   Query,
 } from '@nestjs/common';
 import { QuestionsService } from './questions.service';
-import { Question } from './schemas/question.schema';
+import { Question, QuestionType } from './schemas/question.schema';
 
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
@@ -28,6 +28,7 @@ import {
   ArrayMaxSize,
   ValidateIf,
   IsOptional,
+  IsEnum,
 } from 'class-validator';
 
 class CreateQuestionDto {
@@ -36,15 +37,15 @@ class CreateQuestionDto {
   text: string;
 
   @IsArray()
-  @ArrayMinSize(4)
-  @ArrayMaxSize(4)
+  @IsOptional()
   @IsString({ each: true })
-  options: string[];
+  options?: string[];
 
   @IsInt()
   @Min(0)
   @Max(3)
-  correctOptionIndex: number;
+  @IsOptional()
+  correctOptionIndex?: number;
 
   @IsString()
   @IsNotEmpty()
@@ -62,6 +63,9 @@ class CreateQuestionDto {
   @IsString()
   @IsOptional()
   explanation?: string;
+
+  @IsEnum(QuestionType)
+  questionType: QuestionType;
 }
 
 class UpdateQuestionDto {
@@ -70,10 +74,8 @@ class UpdateQuestionDto {
   text?: string;
 
   @IsArray()
-  @ArrayMinSize(4)
-  @ArrayMaxSize(4)
-  @IsString({ each: true })
   @IsOptional()
+  @IsString({ each: true })
   options?: string[];
 
   @IsInt()
@@ -99,6 +101,10 @@ class UpdateQuestionDto {
   @IsString()
   @IsOptional()
   explanation?: string;
+
+  @IsEnum(QuestionType)
+  @IsOptional()
+  questionType?: QuestionType;
 }
 
 @Controller('questions')
@@ -165,3 +171,4 @@ export class QuestionsController {
     return { message: 'Question deleted successfully' };
   }
 }
+

@@ -3,6 +3,11 @@ import { HydratedDocument } from 'mongoose';
 
 export type QuestionDocument = HydratedDocument<Question>;
 
+export enum QuestionType {
+  MULTIPLE_CHOICE = 'multiple_choice',
+  TEXT_ANSWER = 'text_answer',
+}
+
 @Schema({
   timestamps: true,
 })
@@ -14,21 +19,19 @@ export class Question {
   text: string;
 
   @Prop({
-    required: true,
-    type: [String], // Array of strings for options
+    type: [String], // Array of strings for options (only for multiple choice)
     validate: {
-      validator: (arr: string[]) => arr.length === 4, // Assuming 4 options for multiple choice
-      message: 'Question must have exactly 4 options',
+      validator: (arr: string[]) => !arr || arr.length === 4,
+      message: 'Options must be exactly 4 elements for multiple choice questions',
     },
   })
-  options: string[];
+  options?: string[];
 
   @Prop({
-    required: true,
     min: 0,
     max: 3,
   })
-  correctOptionIndex: number; // 0-based index of the correct option
+  correctOptionIndex?: number; // 0-based index of the correct option (only for multiple choice)
 
   @Prop({
     required: true,
@@ -53,6 +56,12 @@ export class Question {
     trim: true,
   })
   explanation: string; // For interactive answer explanation
+
+  @Prop({
+    required: true,
+    enum: QuestionType,
+  })
+  questionType: QuestionType;
 }
 
 export const QuestionSchema = SchemaFactory.createForClass(Question);
