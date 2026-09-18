@@ -19,10 +19,16 @@ export class Question {
   text: string;
 
   @Prop({
-    type: [String], // Array of strings for options (only for multiple choice)
+    type: [String],
+    default: undefined,  
     validate: {
-      validator: (arr: string[]) => !arr || arr.length === 4,
-      message: 'Options must be exactly 4 elements for multiple choice questions',
+      validator: function (this: Question, arr: string[] | undefined) {
+        if (this.questionType === QuestionType.TEXT_ANSWER) {
+          return !arr || arr.length === 0;
+        }
+        return Array.isArray(arr) && arr.length === 4;
+      },
+      message: 'Multiple choice questions must have exactly 4 options',
     },
   })
   options?: string[];
@@ -30,8 +36,11 @@ export class Question {
   @Prop({
     min: 0,
     max: 3,
+    required: function (this: Question) {
+      return this.questionType === QuestionType.MULTIPLE_CHOICE;
+    },
   })
-  correctOptionIndex?: number; // 0-based index of the correct option (only for multiple choice)
+  correctOptionIndex?: number;
 
   @Prop({
     required: true,
@@ -50,12 +59,12 @@ export class Question {
     min: 1,
     max: 5,
   })
-  difficulty: number; // 1: easy, 2: medium-low, 3: medium, 4: medium-high, 5: hard
+  difficulty: number;
 
   @Prop({
     trim: true,
   })
-  explanation: string; // For interactive answer explanation
+  explanation: string;
 
   @Prop({
     required: true,

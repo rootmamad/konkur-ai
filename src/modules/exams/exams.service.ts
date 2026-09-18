@@ -174,26 +174,20 @@ answers: allQuestions.map((q) => ({
       throw new NotFoundException('Question not found');
     }
 
-    // Update the answer based on question type
-    const answerUpdate: {
-      answeredAt: Date;
-      selectedOption?: number;
-      textAnswer?: string;
-    } = {
-      answeredAt: new Date(),
-    };
+        // Get the subdocument (Mongoose subdoc, not plain object)
+    const targetAnswer = attempt.answers[questionIndex];
 
-    if (
-      question.options &&
-      question.options.length === 4
-    ) {
+    // Set the answeredAt timestamp
+    targetAnswer.answeredAt = new Date();
+
+    if (question.options && question.options.length === 4) {
       // Multiple choice question
       if (typeof answer !== 'number' || answer < 0 || answer > 3) {
         throw new BadRequestException(
           'Invalid answer for multiple choice question',
         );
       }
-      answerUpdate.selectedOption = answer as number;
+      targetAnswer.selectedOption = answer as number;
     } else {
       // Text answer question
       if (typeof answer !== 'string') {
@@ -201,17 +195,12 @@ answers: allQuestions.map((q) => ({
           'Invalid answer for text question',
         );
       }
-      answerUpdate.textAnswer = answer as string;
+      targetAnswer.textAnswer = answer as string;
     }
 
-    // Update the specific answer in the array
-    // Using 'as any' to bypass TypeScript's strict checking on Mongoose subdocuments
-    (attempt.answers[questionIndex] as any) = {
-      ...attempt.answers[questionIndex],
-      ...answerUpdate,
-    };
-
-    // Save the attempt
+    // Tell Mongoose that this subdocument was modified
+    //attempt.markModified('answers');
+    attempt.markModified(`answers.${questionIndex}`);
     await attempt.save();
   }
 
