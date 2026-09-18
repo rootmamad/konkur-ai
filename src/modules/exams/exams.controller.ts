@@ -1,39 +1,31 @@
 import {
-  Controller,
-  Post,
-  Body,
-  Param,
-  Get,
-  UseGuards,
-  Req,
+  Controller, Post, Body, Param, Get, UseGuards, Req,
 } from '@nestjs/common';
+import { ApiBearerAuth, ApiTags, ApiOperation } from '@nestjs/swagger';
 import { ExamsService } from './exams.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { UserRole } from '../../modules/users/enums/user-role.enum';
 import { Request } from 'express';
-import { QuestionType } from '../questions/schemas/question.schema';
+import { StartExamDto } from './dto/start-exam.dto';
+import { SubmitAnswerDto } from './dto/submit-answer.dto';
 
+@ApiTags('exams')
+@ApiBearerAuth('access-token')
 @Controller('exams')
 export class ExamsController {
   constructor(private readonly examsService: ExamsService) {}
 
-  // POST /exams/start
-  // Body: { questionType: 'multiple_choice' | 'text_answer', counts: { easy: number, normal: number, hard: number }, durationSeconds: number }
   @Post('start')
+  @ApiOperation({ summary: 'Start a new exam attempt' })
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.STUDENT)
   async startExam(
     @Req() req: Request & { user: { userId: string } },
-    @Body()
-    body: {
-      questionType: QuestionType;
-      counts: { easy: number; normal: number; hard: number };
-      durationSeconds: number;
-    },
+    @Body() body: StartExamDto,
   ) {
-    const userId = req['user'].userId; // Assuming CurrentUser decorator sets req.user
+    const userId = req.user.userId;
     return this.examsService.startExam(
       userId,
       body.questionType,
@@ -42,18 +34,16 @@ export class ExamsController {
     );
   }
 
-  // POST /exams/:attemptId/answers
-  // Body: { questionIndex: number, answer: number | string }
   @Post(':attemptId/answers')
+  @ApiOperation({ summary: 'Submit an answer to a question' })
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.STUDENT)
   async submitAnswer(
     @Param('attemptId') attemptId: string,
     @Req() req: Request & { user: { userId: string } },
-    @Body()
-    body: { questionIndex: number; answer: number | string },
+    @Body() body: SubmitAnswerDto,
   ) {
-    const userId = req['user'].userId;
+    const userId = req.user.userId;
     await this.examsService.submitAnswer(
       attemptId,
       userId,
@@ -63,7 +53,6 @@ export class ExamsController {
     return { message: 'Answer submitted successfully' };
   }
 
-  // POST /exams/:attemptId/finish
   @Post(':attemptId/finish')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.STUDENT)
@@ -71,11 +60,9 @@ export class ExamsController {
     @Param('attemptId') attemptId: string,
     @Req() req: Request & { user: { userId: string } },
   ) {
-    const userId = req['user'].userId;
-    return this.examsService.finishExam(attemptId, userId);
+    return this.examsService.finishExam(attemptId, req.user.userId);
   }
 
-  // GET /exams/:attemptId
   @Get(':attemptId')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.STUDENT)
@@ -83,16 +70,13 @@ export class ExamsController {
     @Param('attemptId') attemptId: string,
     @Req() req: Request & { user: { userId: string } },
   ) {
-    const userId = req['user'].userId;
-    return this.examsService.getExamAttempt(attemptId, userId);
+    return this.examsService.getExamAttempt(attemptId, req.user.userId);
   }
 
-  // GET /exams
   @Get()
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.STUDENT)
   async getUserExams(@Req() req: Request & { user: { userId: string } }) {
-    const userId = req['user'].userId;
-    return this.examsService.getUserExams(userId);
+    return this.examsService.getUserExams(req.user.userId);
   }
 }
