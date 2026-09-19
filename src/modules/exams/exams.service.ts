@@ -5,7 +5,7 @@ import { Model, Types } from 'mongoose';
 import { ExamAttempt, ExamAttemptDocument } from './exam-attempt.schema';
 import { QuestionsService } from '../questions/questions.service';
 import { QuestionType } from '../questions/schemas/question.schema';
-import { AIService } from './ai.service';
+import { AIService } from '../ai/ai.service';
 
 @Injectable()
 export class ExamsService {
@@ -274,7 +274,7 @@ if (
             answer.aiScore = 0;
           } else {
             // Call AI to evaluate the text answer
-            const aiResult = await this.aiService.call(
+            const aiResult = await this.aiService.generate(
               `Determine if the student's answer is semantically equivalent to the correct answer.
               Question: ${question.text}
               Correct answer: ${question.explanation || 'No explanation provided'}
@@ -369,7 +369,7 @@ if (
       Format your response as a clear, helpful report for the student.
     `;
 
-    attempt.aiAnalysis = await this.aiService.call(aiAnalysisPrompt);
+    attempt.aiAnalysis = await this.aiService.generate(aiAnalysisPrompt);
 
     // Save the attempt with results
     return await attempt.save();
