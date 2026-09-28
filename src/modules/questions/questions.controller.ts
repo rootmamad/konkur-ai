@@ -1,168 +1,71 @@
 import {
-  Controller,
-  Get,
-  Post,
   Body,
-  Patch,
-  Param,
+  Controller,
   Delete,
-  UseGuards,
+  Get,
+  Param,
+  Patch,
+  Post,
   Query,
+  UseGuards,
 } from '@nestjs/common';
-import { QuestionsService } from './questions.service';
-import { Question, QuestionType } from './schemas/question.schema';
 
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { Roles } from '../../common/decorators/roles.decorator';
-import { UserRole } from '../../modules/users/enums/user-role.enum';
-
+import { UserRole } from '../users/enums/user-role.enum';
+import { QuestionsService } from './questions.service';
 import {
-  IsNotEmpty,
-  IsString,
-  IsInt,
-  Min,
-  Max,
-  IsArray,
-  ArrayMinSize,
-  ArrayMaxSize,
-  ValidateIf,
-  IsOptional,
-  IsEnum,
-} from 'class-validator';
-
-class CreateQuestionDto {
-  @IsString()
-  @IsNotEmpty()
-  text: string;
-
-  @IsArray()
-  @IsOptional()
-  @IsString({ each: true })
-  options?: string[];
-
-  @IsInt()
-  @Min(0)
-  @Max(3)
-  @IsOptional()
-  correctOptionIndex?: number;
-
-  @IsString()
-  @IsNotEmpty()
-  subject: string;
-
-  @IsString()
-  @IsNotEmpty()
-  topic: string;
-
-  @IsInt()
-  @Min(1)
-  @Max(5)
-  difficulty: number;
-
-  @IsString()
-  @IsOptional()
-  explanation?: string;
-
-  @IsEnum(QuestionType)
-  questionType: QuestionType;
-}
-
-class UpdateQuestionDto {
-  @IsString()
-  @IsOptional()
-  text?: string;
-
-  @IsArray()
-  @IsOptional()
-  @IsString({ each: true })
-  options?: string[];
-
-  @IsInt()
-  @Min(0)
-  @Max(3)
-  @IsOptional()
-  correctOptionIndex?: number;
-
-  @IsString()
-  @IsOptional()
-  subject?: string;
-
-  @IsString()
-  @IsOptional()
-  topic?: string;
-
-  @IsInt()
-  @Min(1)
-  @Max(5)
-  @IsOptional()
-  difficulty?: number;
-
-  @IsString()
-  @IsOptional()
-  explanation?: string;
-
-  @IsEnum(QuestionType)
-  @IsOptional()
-  questionType?: QuestionType;
-}
+  CreateQuestionDto,
+  UpdateQuestionDto,
+} from './dto/question.dto';
 
 @Controller('questions')
 export class QuestionsController {
   constructor(private readonly questionsService: QuestionsService) {}
 
-  // GET /questions - Get questions with filters (e.g., ?subject=Arabic&topic=Grammar)
   @Get()
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.STUDENT)
-  async getQuestions(@Query() filters: any) {
+  getQuestions(@Query() filters: Record<string, unknown>) {
     return this.questionsService.getQuestions(filters);
   }
 
-  // GET /questions/random - Get random questions for exam generation
   @Get('random')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.STUDENT)
-  async getRandomQuestions(
-    @Query('count') count: number = 10,
-    @Query() filters: any,
+  getRandomQuestions(
+    @Query('count') count = 10,
+    @Query() filters: Record<string, unknown>,
   ) {
-    // Remove count from filters so it doesn't interfere with the $match
-    const { count: _, ...filterCriteria } = filters;
+    const { count: _ignored, ...filterCriteria } = filters;
     return this.questionsService.getRandomQuestions(
       Number(count),
       filterCriteria,
     );
   }
 
-  // GET /questions/:id - Get a single question by ID
   @Get(':id')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.STUDENT)
-  async getQuestionById(@Param('id') id: string) {
+  getQuestionById(@Param('id') id: string) {
     return this.questionsService.getQuestionById(id);
   }
 
-  // POST /questions - Create a new question (admin only)
   @Post()
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN)
-  async createQuestion(@Body() createQuestionDto: CreateQuestionDto) {
-    return this.questionsService.createQuestion(createQuestionDto);
+  createQuestion(@Body() dto: CreateQuestionDto) {
+    return this.questionsService.createQuestion(dto);
   }
 
-  // PATCH /questions/:id - Update a question (admin only)
   @Patch(':id')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN)
-  async updateQuestion(
-    @Param('id') id: string,
-    @Body() updateQuestionDto: UpdateQuestionDto,
-  ) {
-    return this.questionsService.updateQuestion(id, updateQuestionDto);
+  updateQuestion(@Param('id') id: string, @Body() dto: UpdateQuestionDto) {
+    return this.questionsService.updateQuestion(id, dto);
   }
 
-  // DELETE /questions/:id - Delete a question (admin only)
   @Delete(':id')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN)
@@ -171,4 +74,3 @@ export class QuestionsController {
     return { message: 'Question deleted successfully' };
   }
 }
-

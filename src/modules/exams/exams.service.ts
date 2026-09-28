@@ -1,417 +1,419 @@
-import { Injectable, NotFoundException, BadRequestException, ForbiddenException } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model, Types } from 'mongoose';
+import { Injectable, Inject, NotFoundException, ForbiddenException } from '@nestjs/common';
+import { DB } from '../../db/db.module';
+import type { Db } from '../../db/db.module';
+import { examTemplate } from '../../db/schema/exam';
+import { examInstance } from '../../db/schema/exam';
+import { attempt } from '../../db/schema/attempt';
+import { response } from '../../db/schema/response';
+import { question } from '../../db/schema/question';
+import { student } from '../../db/schema/student';
+import { answerKey } from '../../db/schema/answer-key';
+import { eq, and, desc, sql, inArray } from 'drizzle-orm';
+import { QuestionType } from '../questions/enums/question-type.enum';
+import { StartExamDto } from './dto/start-exam.dto';
+import { SubmitAnswerDto } from './dto/submit-answer.dto';
 
-import { ExamAttempt, ExamAttemptDocument } from './exam-attempt.schema';
-import { QuestionsService } from '../questions/questions.service';
-import { QuestionType } from '../questions/schemas/question.schema';
-import { AIService } from '../ai/ai.service';
+export interface ExamAttemptResult {
+  attemptId: string;
+  questionOrder: string[];
+  durationSeconds: number;
+  startedAt: Date;
+}
+
+export interface QuestionForExam {
+  id: string;
+  version: number;
+  type: QuestionType;
+  text: string;
+  contentBlocks: unknown[];
+  options: unknown[];
+  subject: string;
+}
 
 @Injectable()
 export class ExamsService {
-  constructor(
-    @InjectModel(ExamAttempt.name)
-    private readonly examAttemptModel: Model<ExamAttemptDocument>,
-    private readonly questionsService: QuestionsService,
-    private readonly aiService: AIService,
-  ) {}
+  constructor(@Inject(DB) private readonly db: Db) {}
 
-  /**
-   * Start a new exam attempt for a user
-   * @param userId - The ID of the user taking the exam
-   * @param questionType - The type of questions for the exam (multiple_choice or text_answer)
-   * @param counts - Object specifying how many questions of each difficulty to include
-   * @param durationSeconds - Total time allowed for the exam in seconds
-   * @returns The created exam attempt (without the correct answers exposed)
-   */
   async startExam(
     userId: string,
     questionType: QuestionType,
     counts: { easy: number; normal: number; hard: number },
     durationSeconds: number,
-): Promise<{
-     attemptId: string;
-     questions: Array<{
-       id: string;
-       text: string;
-       options: string[]; // For multiple choice questions (empty for text questions)
-       questionType: 'multiple_choice' | 'text_answer';
-     }>;
-   }> {
-    // Validate counts
-    if (
-      counts.easy < 0 ||
-      counts.normal < 0 ||
-      counts.hard < 0 ||
-      (counts.easy + counts.normal + counts.hard) === 0
-    ) {
-      throw new BadRequestException(
-        'At least one question must be specified for the exam',
-      );
+  ): Promise<ExamAttemptResult> {
+    // Get student by account ID
+    const studentRows = await this.db
+      .select({ id: student.id })
+      .from(student)
+      .where(eq(student.accountId, userId))
+      .limit(1);
+
+    if (studentRows.length === 0) {
+      throw new NotFoundException('Student profile not found');
     }
 
-// Build difficulty filters for each level
-  const difficultyFilters = {
-    easy: { difficulty: { $lte: 2 }, questionType }, // Easy: difficulty 1-2
-    normal: { difficulty: { $gte: 3, $lte: 4 }, questionType }, // Normal: difficulty 3-4
-    hard: { difficulty: { $gte: 5 }, questionType }, // Hard: difficulty 5
-  };
+    const studentId = studentRows[0].id;
 
-    // Fetch questions for each difficulty level, filtered by questionType
-    const [easyQuestions, normalQuestions, hardQuestions] =
-      await Promise.all([
-        this.questionsService.getRandomQuestions(
-          counts.easy,
-          difficultyFilters.easy,
-        ),
-        this.questionsService.getRandomQuestions(
-          counts.normal,
-          difficultyFilters.normal,
-        ),
-        this.questionsService.getRandomQuestions(
-          counts.hard,
-          difficultyFilters.hard,
-        ),
-      ]);
+    // Build question selection criteria
+    const totalCount = counts.easy + counts.normal + counts.hard;
+    if (totalCount === 0) {
+      throw new Error('At least one question must be selected');
+    }
 
-    // Combine and shuffle questions
-    const allQuestions = [
-      ...easyQuestions.map((q) => ({ ...q, difficulty: 'easy' })),
-      ...normalQuestions.map((q) => ({ ...q, difficulty: 'normal' })),
-      ...hardQuestions.map((q) => ({ ...q, difficulty: 'hard' })),
+    // Select random questions matching criteria
+    const selectedQuestions: QuestionForExam[] = [];
+
+    // For each difficulty level
+    const difficulties = [
+      { level: 1, count: counts.easy },
+      { level: 2, count: counts.normal },
+      { level: 3, count: counts.hard },
     ];
 
-    // Shuffle the array (Fisher-Yates algorithm)
-    for (let i = allQuestions.length - 1; i > 0; i--) {
+    for (const { level, count } of difficulties) {
+      if (count > 0) {
+        const questions = await this.db
+          .select({
+            id: question.id,
+            version: question.version,
+            type: question.type,
+            text: question.text,
+            contentBlocks: question.contentBlocks,
+            options: question.options,
+            subject: question.subject,
+          })
+          .from(question)
+          .where(
+            and(
+              sql`${question.status} = 'published'`,
+              sql`${question.type} = ${questionType}`,
+              eq(question.difficultyAi, level),
+            ),
+          )
+          .orderBy(sql`random()`)
+          .limit(count);
+
+        selectedQuestions.push(...questions.map(q => ({
+          ...q,
+          type: q.type as QuestionType,
+          contentBlocks: (q.contentBlocks as unknown[]) ?? [],
+          options: (q.options as unknown[]) ?? [],
+        })));
+      }
+    }
+
+    if (selectedQuestions.length === 0) {
+      throw new Error('No questions found matching criteria');
+    }
+
+    // Shuffle the selected questions
+    for (let i = selectedQuestions.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
-      [allQuestions[i], allQuestions[j]] = [
-        allQuestions[j],
-        allQuestions[i],
+      [selectedQuestions[i], selectedQuestions[j]] = [
+        selectedQuestions[j],
+        selectedQuestions[i],
       ];
     }
 
-    // Create the exam attempt record
-    const attempt = new this.examAttemptModel({
-      userId: new Types.ObjectId(userId),
-      startTime: new Date(),
+    // Get or create a template for this type
+    const templateRows = await this.db
+      .select()
+      .from(examTemplate)
+      .where(eq(examTemplate.kind, 'smart_mix'))
+      .limit(1);
+
+    let templateId: string;
+    if (templateRows.length > 0) {
+      templateId = templateRows[0].id;
+    } else {
+      const newTemplate = await this.db
+        .insert(examTemplate)
+        .values({
+          kind: 'smart_mix',
+          title: 'Smart Mix Exam',
+          config: { questionType, counts },
+          settingsVersion: 1,
+        })
+        .returning({ id: examTemplate.id });
+      templateId = newTemplate[0].id;
+    }
+
+    // Create exam instance with frozen question order
+    const instance = await this.db
+      .insert(examInstance)
+      .values({
+        templateId,
+        questionOrder: selectedQuestions.map((q) => q.id),
+        settingsSnapshot: {
+          questionType,
+          counts,
+          durationSeconds,
+          generatedAt: new Date().toISOString(),
+        },
+      })
+      .returning({ id: examInstance.id });
+
+    const instanceId = instance[0].id;
+
+    // Create attempt
+    const idempotencyKey = `exam-${studentId}-${instanceId}-${Date.now()}`;
+    const attemptResult = await this.db
+      .insert(attempt)
+      .values({
+        studentId,
+        examInstanceId: instanceId,
+        status: 'in_progress',
+        idempotencyKey,
+      })
+      .returning({ id: attempt.id });
+
+    const attemptId = attemptResult[0].id;
+
+    return {
+      attemptId,
+      questionOrder: selectedQuestions.map((q) => q.id),
       durationSeconds,
-answers: allQuestions.map((q) => ({
-         questionId: q._id as Types.ObjectId,
-         questionType: q.questionType,
-       })),
-    });
-
-    const savedAttempt = await attempt.save();
-
-// Prepare the questions to return to the user (without correct answers)
-     const questionsForUser = allQuestions.map((q) => ({
-       id: q._id.toString(),
-       text: q.text ?? '',
-       options: q.options ?? [],
-       questionType:
-         q.questionType === QuestionType.MULTIPLE_CHOICE
-       ? ('multiple_choice' as const)
-      : ('text_answer' as const),
-     }));
-
-     return {
-       attemptId: (savedAttempt._id as Types.ObjectId).toString(),
-       questions: questionsForUser,
-     };
+      startedAt: new Date(),
+    };
   }
 
-  /**
-   * Submit an answer for a question in an exam attempt
-   * @param attemptId - The ID of the exam attempt
-   * @param userId - The ID of the user (for authorization)
-   * @param questionIndex - The index of the question in the attempt's questions array
-   * @param answer - The user's answer (option index for MCQ, text for text questions)
-   */
   async submitAnswer(
     attemptId: string,
     userId: string,
     questionIndex: number,
     answer: number | string,
   ): Promise<void> {
-    // Find the attempt
-    const attempt = await this.examAttemptModel.findById(attemptId);
-    if (!attempt) {
-      throw new NotFoundException('Exam attempt not found');
+    // Verify attempt belongs to user
+    const studentRows = await this.db
+      .select({ id: student.id })
+      .from(student)
+      .where(eq(student.accountId, userId))
+      .limit(1);
+
+    if (studentRows.length === 0) {
+      throw new NotFoundException('Student profile not found');
     }
 
-    // Ensure the attempt belongs to the user
-    if (attempt.userId.toString() !== userId) {
-      throw new ForbiddenException('You do not own this exam attempt');
+    const studentId = studentRows[0].id;
+
+    const attemptRows = await this.db
+      .select()
+      .from(attempt)
+      .where(and(eq(attempt.id, attemptId), eq(attempt.studentId, studentId)))
+      .limit(1);
+
+    if (attemptRows.length === 0) {
+      throw new NotFoundException('Attempt not found or access denied');
     }
 
-    // Ensure the exam hasn't been submitted yet
-    if (attempt.submittedAt) {
-      throw new BadRequestException('Exam has already been submitted');
+    const attemptRecord = attemptRows[0];
+
+    if (attemptRecord.status !== 'in_progress') {
+      throw new ForbiddenException('Attempt is not in progress');
     }
 
-    // Check time limit
-    const now = new Date();
-    const elapsedSeconds =
-      (now.getTime() - attempt.startTime.getTime()) / 1000;
-    if (elapsedSeconds > attempt.durationSeconds) {
-      throw new BadRequestException('Exam time has expired');
+    // Get exam instance to find question at index
+    const instanceRows = await this.db
+      .select()
+      .from(examInstance)
+      .where(eq(examInstance.id, attemptRecord.examInstanceId))
+      .limit(1);
+
+    if (instanceRows.length === 0) {
+      throw new NotFoundException('Exam instance not found');
     }
 
-    // Ensure the question index is valid
-    if (
-      questionIndex < 0 ||
-      questionIndex >= attempt.answers.length
-    ) {
-      throw new BadRequestException('Invalid question index');
+    const questionOrder = instanceRows[0].questionOrder as string[];
+    if (questionIndex < 0 || questionIndex >= questionOrder.length) {
+      throw new Error('Invalid question index');
     }
 
-    // Get the question details to determine its type
-    const questionId = attempt.answers[questionIndex].questionId;
-    const question = await this.questionsService.getQuestionById(
-      questionId.toString(),
-    );
-    if (!question) {
+    const questionId = questionOrder[questionIndex];
+
+    // Get question details for version
+    const questionRows = await this.db
+      .select({ id: question.id, version: question.version, type: question.type })
+      .from(question)
+      .where(eq(question.id, questionId))
+      .limit(1);
+
+    if (questionRows.length === 0) {
       throw new NotFoundException('Question not found');
     }
 
-        // Get the subdocument (Mongoose subdoc, not plain object)
-    const targetAnswer = attempt.answers[questionIndex];
+    const questionRecord = questionRows[0];
 
-    // Set the answeredAt timestamp
-    targetAnswer.answeredAt = new Date();
+    // Check if response already exists for this attempt + question
+    const existingResponse = await this.db
+      .select({ id: response.id, attemptNumber: response.attemptNumber })
+      .from(response)
+      .where(
+        and(
+          eq(response.attemptId, attemptId),
+          eq(response.questionId, questionId),
+        ),
+      )
+      .orderBy(desc(response.attemptNumber))
+      .limit(1);
 
-    if (question.options && question.options.length === 4) {
-      // Multiple choice question
-      if (typeof answer !== 'number' || answer < 0 || answer > 3) {
-        throw new BadRequestException(
-          'Invalid answer for multiple choice question',
-        );
-      }
-      targetAnswer.selectedOption = answer as number;
-    } else {
-      // Text answer question
-      if (typeof answer !== 'string') {
-        throw new BadRequestException(
-          'Invalid answer for text question',
-        );
-      }
-      targetAnswer.textAnswer = answer as string;
-    }
+    const nextAttemptNumber = existingResponse.length > 0
+      ? existingResponse[0].attemptNumber + 1
+      : 1;
 
-    // Tell Mongoose that this subdocument was modified
-    //attempt.markModified('answers');
-    attempt.markModified(`answers.${questionIndex}`);
-    await attempt.save();
+    // Insert response
+    await this.db.insert(response).values({
+      attemptId,
+      questionId,
+      questionVersion: questionRecord.version,
+      selectedOption: typeof answer === 'number' ? answer : null,
+      textAnswer: typeof answer === 'string' ? answer : null,
+      attemptNumber: nextAttemptNumber,
+      answeredAt: new Date(),
+    });
   }
 
-  /**
-   * Finish an exam attempt, evaluate answers, calculate score, and get AI analysis
-   * @param attemptId - The ID of the exam attempt
-   * @param userId - The ID of the user (for authorization)
-   * @returns The finished exam attempt with results and AI analysis
-   */
-  async finishExam(
-    attemptId: string,
-    userId: string,
-  ): Promise<ExamAttemptDocument> {
-    // Find the attempt
-    const attempt = await this.examAttemptModel.findById(attemptId);
-    if (!attempt) {
-      throw new NotFoundException('Exam attempt not found');
+  async finishExam(attemptId: string, userId: string): Promise<{ totalScore: number }> {
+    // Verify attempt belongs to user
+    const studentRows = await this.db
+      .select({ id: student.id })
+      .from(student)
+      .where(eq(student.accountId, userId))
+      .limit(1);
+
+    if (studentRows.length === 0) {
+      throw new NotFoundException('Student profile not found');
     }
 
-    // Ensure the attempt belongs to the user
-    if (attempt.userId.toString() !== userId) {
-      throw new ForbiddenException('You do not own this exam attempt');
+    const studentId = studentRows[0].id;
+
+    const attemptRows = await this.db
+      .select()
+      .from(attempt)
+      .where(and(eq(attempt.id, attemptId), eq(attempt.studentId, studentId)))
+      .limit(1);
+
+    if (attemptRows.length === 0) {
+      throw new NotFoundException('Attempt not found or access denied');
     }
 
-    // Ensure the exam hasn't been submitted yet
-    if (attempt.submittedAt) {
-      throw new BadRequestException('Exam has already been submitted');
+    const attemptRecord = attemptRows[0];
+
+    if (attemptRecord.status !== 'in_progress') {
+      throw new ForbiddenException('Attempt is not in progress');
     }
 
-    // Set submitted time
-    attempt.submittedAt = new Date();
+    // Get all responses for this attempt
+    const responses = await this.db
+      .select()
+      .from(response)
+      .where(eq(response.attemptId, attemptId));
 
-    // Evaluate each answer
-    let correctCount = 0;
-    const totalQuestions = attempt.answers.length;
+    // Grade responses
+    let totalScore = 0;
 
-    for (let i = 0; i < totalQuestions; i++) {
-      const answer = attempt.answers[i];
-      const questionId = answer.questionId.toString();
+    for (const resp of responses) {
+      // Get answer key
+      const answerKeyRows = await this.db
+        .select()
+        .from(answerKey)
+        .where(
+          and(
+            eq(answerKey.questionId, resp.questionId),
+            eq(answerKey.questionVersion, resp.questionVersion),
+          ),
+        )
+        .limit(1);
 
-      // Fetch the question to get the correct answer
-      const question = await this.questionsService.getQuestionById(
-        questionId,
-      );
-      if (!question) {
-        // If question is missing, mark as incorrect and continue
-        answer.isCorrect = false;
-        answer.aiScore = 0;
-        continue;
-      }
+      if (answerKeyRows.length > 0) {
+        const ak = answerKeyRows[0];
+        let isCorrect = false;
 
-if (
-          question?.options &&
-          question.options.length === 4
-        ) {
-          // Multiple choice question
-          const selectedOption = answer.selectedOption;
-          if (selectedOption === undefined) {
-            // No answer selected
-            answer.isCorrect = false;
-          } else {
-            answer.isCorrect =
-              selectedOption === question.correctOptionIndex;
-          }
-          if (answer.isCorrect) correctCount++;
-        } else {
-          // Text answer question
-          if (!answer.textAnswer) {
-            // No answer provided
-            answer.isCorrect = false;
-            answer.aiScore = 0;
-          } else {
-            // Call AI to evaluate the text answer
-            const aiResult = await this.aiService.generate(
-              `Determine if the student's answer is semantically equivalent to the correct answer.
-              Question: ${question.text}
-              Correct answer: ${question.explanation || 'No explanation provided'}
-              Student answer: ${answer.textAnswer}
-              Respond with JSON: { \"isCorrect\": boolean, \"score\": 0-1 }`,
-            );
-
-            // Parse the AI response (assuming it returns valid JSON)
-            let aiParsed = { isCorrect: false, score: 0 };
-            try {
-              aiParsed = JSON.parse(aiResult);
-            } catch (e) {
-              // If AI returns invalid JSON, fall back to simple comparison
-              const isCorrect =
-                answer.textAnswer
-                  .toLowerCase()
-                  .trim() ===
-                (question.explanation || '')
-                  .toLowerCase()
-                  .trim();
-              aiParsed = {
-                isCorrect,
-                score: isCorrect ? 1 : 0,
-              };
-            }
-
-            answer.isCorrect = aiParsed.isCorrect;
-            answer.aiScore = aiParsed.score;
-            if (answer.isCorrect) correctCount++;
-          }
+        if (ak.correctOptionIndex !== null && resp.selectedOption !== null) {
+          isCorrect = ak.correctOptionIndex === resp.selectedOption;
+        } else if (ak.correctText && resp.textAnswer) {
+          isCorrect = ak.correctText.trim().toLowerCase() === resp.textAnswer.trim().toLowerCase();
         }
 
-      // Update the answer in the attempt
-      attempt.answers[i] = answer;
+        await this.db
+          .update(response)
+          .set({ isCorrect })
+          .where(eq(response.id, resp.id));
+
+        if (isCorrect) {
+          totalScore += 1; // Simple scoring: 1 point per correct answer
+        }
+      }
     }
 
-    // Calculate total score as percentage
-    attempt.totalScore =
-      totalQuestions > 0
-        ? Math.round((correctCount / totalQuestions) * 100)
-        : 0;
+    // Update attempt status
+    await this.db
+      .update(attempt)
+      .set({
+        status: 'submitted',
+        submittedAt: new Date(),
+        totalScore,
+      })
+      .where(eq(attempt.id, attemptId));
 
-    // Generate AI analysis for the entire exam
-    const questionsDetails = await Promise.all(
-      attempt.answers.map(async (ans, index) => {
-        const question = await this.questionsService.getQuestionById(
-          ans.questionId.toString(),
-        );
-        return {
-          questionId: ans.questionId.toString(),
-          questionText: question?.text || 'Unknown question',
-          questionType:
-            question?.options && question.options.length === 4
-              ? 'multiple_choice'
-              : 'text_answer',
-          userAnswer:
-            ans.selectedOption !== undefined
-              ? ans.selectedOption
-              : ans.textAnswer,
-          correctAnswer:
-            question?.options && question.options.length === 4
-              ? question.correctOptionIndex
-              : question.explanation,
-          isCorrect: ans.isCorrect,
-          aiScore: ans.aiScore,
-        };
-      }),
-    );
-
-    const aiAnalysisPrompt = `
-      You are a Konkorexam expert analyzing a student's exam results.
-      Exam details:
-      - Total questions: ${totalQuestions}
-      - Correct answers: ${correctCount}
-      - Score: ${attempt.totalScore}%
-      
-      Question-by-question breakdown:
-      ${questionsDetails
-        .map(
-          (q, i) => `
-        ${i + 1}. [${q.questionType}] 
-           Question: ${q.questionText}
-           User's answer: ${q.userAnswer}
-           Correct answer: ${q.correctAnswer}
-           Result: ${q.isCorrect ? 'Correct' : 'Incorrect'}
-           ${q.questionType === 'text_answer' ? `AI similarity score: ${q.aiScore}` : ''}
-      `,
-        )
-        .join('\n')}
-      
-      Provide a detailed analysis of the student's performance, highlighting strengths, weaknesses, and specific recommendations for improvement.
-      Format your response as a clear, helpful report for the student.
-    `;
-
-    attempt.aiAnalysis = await this.aiService.generate(aiAnalysisPrompt);
-
-    // Save the attempt with results
-    return await attempt.save();
+    return { totalScore };
   }
 
-  /**
-   * Get an exam attempt by ID (for reviewing)
-   * @param attemptId - The ID of the exam attempt
-   * @param userId - The ID of the user (for authorization)
-   * @returns The exam attempt with questions and answers
-   */
-  async getExamAttempt(
-    attemptId: string,
-    userId: string,
-  ): Promise<ExamAttemptDocument> {
-    const attempt = await this.examAttemptModel.findById(attemptId);
-    if (!attempt) {
-      throw new NotFoundException('Exam attempt not found');
+  async getExamAttempt(attemptId: string, userId: string): Promise<any> {
+    const studentRows = await this.db
+      .select({ id: student.id })
+      .from(student)
+      .where(eq(student.accountId, userId))
+      .limit(1);
+
+    if (studentRows.length === 0) {
+      throw new NotFoundException('Student profile not found');
     }
 
-    if (attempt.userId.toString() !== userId) {
-      throw new ForbiddenException('You do not own this exam attempt');
+    const studentId = studentRows[0].id;
+
+    const attemptRows = await this.db
+      .select()
+      .from(attempt)
+      .where(and(eq(attempt.id, attemptId), eq(attempt.studentId, studentId)))
+      .limit(1);
+
+    if (attemptRows.length === 0) {
+      throw new NotFoundException('Attempt not found or access denied');
     }
 
-    // Populate the questions for each answer
-    const attemptWithQuestions = await this.examAttemptModel.populate(
-      attempt,
-      'answers.questionId',
-    );
+    const attemptRecord = attemptRows[0];
 
-    return attemptWithQuestions;
+    // Get responses
+    const responses = await this.db
+      .select()
+      .from(response)
+      .where(eq(response.attemptId, attemptId));
+
+    return {
+      ...attemptRecord,
+      responses,
+    };
   }
 
-  /**
-   * Get all exam attempts for a user
-   * @param userId - The ID of the user
-   * @returns Array of exam attempts (sorted by start time, newest first)
-   */
-  async getUserExams(userId: string): Promise<ExamAttemptDocument[]> {
-    return this.examAttemptModel
-      .find({ userId: new Types.ObjectId(userId) })
-      .sort({ startTime: -1 })
-      .exec();
+  async getUserExams(userId: string): Promise<any[]> {
+    const studentRows = await this.db
+      .select({ id: student.id })
+      .from(student)
+      .where(eq(student.accountId, userId))
+      .limit(1);
+
+    if (studentRows.length === 0) {
+      throw new NotFoundException('Student profile not found');
+    }
+
+    const studentId = studentRows[0].id;
+
+    const attempts = await this.db
+      .select()
+      .from(attempt)
+      .where(eq(attempt.studentId, studentId))
+      .orderBy(desc(attempt.startedAt))
+      .limit(50);
+
+    return attempts;
   }
 }

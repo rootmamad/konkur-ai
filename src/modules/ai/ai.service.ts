@@ -18,9 +18,9 @@ export class AIService {
   ) {}
 
   /**
-   * یه متن بفرست، جواب بگیر.
-   * @param prompt متنی که می‌خوای بفرستی
-   * @param modelName کدوم مدل (پیش‌فرض: DEFAULT_AI_MODEL)
+   * Send a prompt, get a completion.
+   * @param prompt the prompt to send
+   * @param modelName which model (default: DEFAULT_AI_MODEL)
    */
   async generate(
     prompt: string,

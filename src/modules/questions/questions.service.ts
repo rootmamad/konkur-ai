@@ -1,85 +1,368 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
-import { PipelineStage } from 'mongoose';
-import { Question, QuestionDocument } from './schemas/question.schema';
+import { Injectable, Inject, NotFoundException } from '@nestjs/common';
+import { DB } from '../../db/db.module';
+import type { Db } from '../../db/db.module';
+import { question } from '../../db/schema/question';
+import { answerKey } from '../../db/schema/answer-key';
+import { explanation } from '../../db/schema/explanation';
+import { rubric } from '../../db/schema/rubric';
+import { topic } from '../../db/schema/topic';
+import { eq, and, desc, sql, SQL } from 'drizzle-orm';
+import { QuestionType } from './enums/question-type.enum';
+import { CreateQuestionDto, UpdateQuestionDto } from './dto/question.dto';
+
+export interface QuestionWithDetails {
+  id: string;
+  version: number;
+  topicId: string | null;
+  type: QuestionType;
+  status: string;
+  text: string;
+  contentBlocks: unknown[];
+  options: unknown[];
+  subject: string;
+  concepts: string[];
+  prerequisites: string[];
+  hasTrap: boolean;
+  difficultyAi: number | null;
+  sourceYear: number | null;
+  sourceSession: string | null;
+  sourceMajor: string | null;
+  sourceLesson: string | null;
+  sourceNumber: number | null;
+  sourcePage: number | null;
+  createdAt: Date;
+  updatedAt: Date;
+  answerKey?: {
+    correctOptionIndex: number | null;
+    correctText: string | null;
+  };
+  explanations?: Array<{
+    origin: string;
+    body: string;
+  }>;
+  rubric?: Array<{
+    partKey: string;
+    maxScore: string;
+    order: number;
+  }>;
+}
 
 @Injectable()
 export class QuestionsService {
-  constructor(
-    @InjectModel(Question.name)
-    private readonly questionModel: Model<QuestionDocument>,
-  ) {}
+  constructor(@Inject(DB) private readonly db: Db) {}
 
-  /**
-   * Create a new question
-   * @param createQuestionDto - Data for the new question
-   */
-  async createQuestion(createQuestionDto: any): Promise<QuestionDocument> {
-    const createdQuestion = new this.questionModel(createQuestionDto);
-    return createdQuestion.save();
-  }
+  async createQuestion(dto: CreateQuestionDto): Promise<QuestionWithDetails> {
+    // Find or create topic
+    let topicId: string | null = null;
+    if (dto.topic) {
+      const existingTopic = await this.db
+        .select({ id: topic.id })
+        .from(topic)
+        .where(eq(topic.slug, dto.topic.toLowerCase().replace(/\s+/g, '-')))
+        .limit(1);
 
-  /**
-   * Get questions with optional filters
-   * @param filters - Object containing filters like subject, topic, difficulty, etc.
-   */
-  async getQuestions(filters: any = {}): Promise<QuestionDocument[]> {
-    return this.questionModel.find(filters).exec();
-  }
-
-  /**
-   * Get a single question by ID
-   * @param id - Question ID
-   */
-  async getQuestionById(id: string): Promise<QuestionDocument> {
-    const question = await this.questionModel.findById(id).exec();
-    if (!question) {
-      throw new NotFoundException(`Question with ID ${id} not found`);
+      if (existingTopic.length > 0) {
+        topicId = existingTopic[0].id;
+      } else {
+        const newTopic = await this.db
+          .insert(topic)
+          .values({
+            slug: dto.topic.toLowerCase().replace(/\s+/g, '-'),
+            title: dto.topic,
+            parentId: null,
+          })
+          .returning({ id: topic.id });
+        topicId = newTopic[0].id;
+      }
     }
-    return question;
-  }
 
-  /**
-   * Update a question by ID
-   * @param id - Question ID
-   * @param updateQuestionDto - Data to update
-   */
-  async updateQuestion(id: string, updateQuestionDto: any): Promise<QuestionDocument> {
-    const existingQuestion = await this.questionModel
-      .findByIdAndUpdate(id, updateQuestionDto, { new: true })
-      .exec();
+    // Insert question - use sql template for enum
+    const questionResult = await this.db
+      .insert(question)
+      .values({
+        topicId,
+        type: dto.questionType as 'multiple_choice' | 'true_false' | 'fill_blank' | 'descriptive' | 'multi_part',
+        status: 'published',
+        text: dto.text,
+        contentBlocks: [{ type: 'text', content: dto.text }],
+        options: dto.options ? dto.options.map((opt, idx) => ({ index: idx, text: opt })) : [],
+        subject: dto.subject,
+        concepts: [],
+        prerequisites: [],
+        hasTrap: false,
+        difficultyAi: dto.difficulty,
+      })
+      .returning();
 
-    if (!existingQuestion) {
-      throw new NotFoundException(`Question with ID ${id} not found`);
+    const newQuestion = questionResult[0];
+
+    // Insert answer key
+    await this.db.insert(answerKey).values({
+      questionId: newQuestion.id,
+      questionVersion: newQuestion.version,
+      correctOptionIndex: dto.correctOptionIndex ?? null,
+      correctText: null,
+    });
+
+    // Insert explanation if provided
+    if (dto.explanation) {
+      await this.db.insert(explanation).values({
+        questionId: newQuestion.id,
+        questionVersion: newQuestion.version,
+        origin: 'official',
+        body: dto.explanation,
+      });
     }
-    return existingQuestion;
+
+    // Return with details
+    return this.getQuestionById(newQuestion.id);
   }
 
-  /**
-   * Delete a question by ID
-   * @param id - Question ID
-   */
+  async getQuestions(filters: Record<string, unknown>): Promise<QuestionWithDetails[]> {
+    const conditions: SQL<unknown>[] = [];
+
+    if (filters.subject) {
+      conditions.push(eq(question.subject, filters.subject as string));
+    }
+    if (filters.type) {
+      conditions.push(sql`${question.type} = ${filters.type as string}`);
+    }
+    if (filters.status) {
+      conditions.push(sql`${question.status} = ${filters.status as string}`);
+    }
+    if (filters.topicId) {
+      conditions.push(eq(question.topicId, filters.topicId as string));
+    }
+
+    const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+
+    const rows = await this.db
+      .select()
+      .from(question)
+      .where(whereClause)
+      .orderBy(desc(question.createdAt))
+      .limit(100);
+
+    return Promise.all(rows.map((q) => this.enrichQuestion(q)));
+  }
+
+  async getQuestionById(id: string): Promise<QuestionWithDetails> {
+    const rows = await this.db
+      .select()
+      .from(question)
+      .where(eq(question.id, id))
+      .limit(1);
+
+    if (rows.length === 0) {
+      throw new NotFoundException('Question not found');
+    }
+
+    return this.enrichQuestion(rows[0]);
+  }
+
+  async updateQuestion(id: string, dto: UpdateQuestionDto): Promise<QuestionWithDetails> {
+    const existing = await this.db
+      .select()
+      .from(question)
+      .where(eq(question.id, id))
+      .limit(1);
+
+    if (existing.length === 0) {
+      throw new NotFoundException('Question not found');
+    }
+
+    const updateData: Record<string, unknown> = { updatedAt: new Date() };
+
+    if (dto.text !== undefined) {
+      updateData.text = dto.text;
+      updateData.contentBlocks = [{ type: 'text', content: dto.text }];
+    }
+    if (dto.options !== undefined) {
+      updateData.options = dto.options.map((opt, idx) => ({ index: idx, text: opt }));
+    }
+    if (dto.subject !== undefined) {
+      updateData.subject = dto.subject;
+    }
+    if (dto.topic !== undefined) {
+      let topicId: string | null = null;
+      if (dto.topic) {
+        const existingTopic = await this.db
+          .select({ id: topic.id })
+          .from(topic)
+          .where(eq(topic.slug, dto.topic.toLowerCase().replace(/\s+/g, '-')))
+          .limit(1);
+
+        if (existingTopic.length > 0) {
+          topicId = existingTopic[0].id;
+        } else {
+          const newTopic = await this.db
+            .insert(topic)
+            .values({
+              slug: dto.topic.toLowerCase().replace(/\s+/g, '-'),
+              title: dto.topic,
+              parentId: null,
+            })
+            .returning({ id: topic.id });
+          topicId = newTopic[0].id;
+        }
+      }
+      updateData.topicId = topicId;
+    }
+    if (dto.difficulty !== undefined) {
+      updateData.difficultyAi = dto.difficulty;
+    }
+    if (dto.questionType !== undefined) {
+      updateData.type = dto.questionType as 'multiple_choice' | 'true_false' | 'fill_blank' | 'descriptive' | 'multi_part';
+    }
+
+    await this.db
+      .update(question)
+      .set(updateData)
+      .where(eq(question.id, id));
+
+    // Update answer key if provided
+    if (dto.correctOptionIndex !== undefined) {
+      await this.db
+        .update(answerKey)
+        .set({ correctOptionIndex: dto.correctOptionIndex })
+        .where(
+          and(
+            eq(answerKey.questionId, id),
+            eq(answerKey.questionVersion, existing[0].version),
+          ),
+        );
+    }
+
+    // Update explanation if provided
+    if (dto.explanation !== undefined) {
+      await this.db
+        .update(explanation)
+        .set({ body: dto.explanation })
+        .where(
+          and(
+            eq(explanation.questionId, id),
+            eq(explanation.questionVersion, existing[0].version),
+            eq(explanation.origin, 'official'),
+          ),
+        );
+    }
+
+    return this.getQuestionById(id);
+  }
+
   async deleteQuestion(id: string): Promise<void> {
-    const result = await this.questionModel.findByIdAndDelete(id).exec();
-    if (!result) {
-      throw new NotFoundException(`Question with ID ${id} not found`);
+    const existing = await this.db
+      .select({ id: question.id })
+      .from(question)
+      .where(eq(question.id, id))
+      .limit(1);
+
+    if (existing.length === 0) {
+      throw new NotFoundException('Question not found');
     }
+
+    // Delete related records first (foreign keys with cascade should handle this)
+    await this.db.delete(question).where(eq(question.id, id));
   }
 
-  /**
-   * Get random questions for exam generation
-   * @param count - Number of questions to retrieve
-   * @param filters - Optional filters (subject, topic, etc.)
-   */
-  async getRandomQuestions(count: number, filters: any = {}): Promise<QuestionDocument[]> {
-    // Using MongoDB aggregation for random sampling
-    const pipeline: PipelineStage[] = [];
-    if (Object.keys(filters).length > 0) {
-      pipeline.push({ $match: filters });
-    }
-    pipeline.push({ $sample: { size: count } });
+  async getRandomQuestions(
+    count: number,
+    filters: Record<string, unknown>,
+  ): Promise<QuestionWithDetails[]> {
+    const conditions: SQL<unknown>[] = [sql`${question.status} = 'published'`];
 
-    return this.questionModel.aggregate(pipeline).exec();
+    if (filters.subject) {
+      conditions.push(eq(question.subject, filters.subject as string));
+    }
+    if (filters.type) {
+      conditions.push(sql`${question.type} = ${filters.type as string}`);
+    }
+    if (filters.topicId) {
+      conditions.push(eq(question.topicId, filters.topicId as string));
+    }
+    if (filters.difficulty) {
+      conditions.push(eq(question.difficultyAi, filters.difficulty as number));
+    }
+
+    // Use PostgreSQL's random() for random selection
+    const rows = await this.db
+      .select()
+      .from(question)
+      .where(and(...conditions))
+      .orderBy(sql`random()`)
+      .limit(count);
+
+    return Promise.all(rows.map((q) => this.enrichQuestion(q)));
+  }
+
+  private async enrichQuestion(q: typeof question.$inferSelect): Promise<QuestionWithDetails> {
+    // Get answer key
+    const answerKeyRows = await this.db
+      .select()
+      .from(answerKey)
+      .where(
+        and(
+          eq(answerKey.questionId, q.id),
+          eq(answerKey.questionVersion, q.version),
+        ),
+      )
+      .limit(1);
+
+    // Get explanations
+    const explanationRows = await this.db
+      .select()
+      .from(explanation)
+      .where(
+        and(
+          eq(explanation.questionId, q.id),
+          eq(explanation.questionVersion, q.version),
+        ),
+      );
+
+    // Get rubric
+    const rubricRows = await this.db
+      .select()
+      .from(rubric)
+      .where(eq(rubric.questionId, q.id))
+      .orderBy(rubric.order);
+
+    return {
+      id: q.id,
+      version: q.version,
+      topicId: q.topicId,
+      type: q.type as QuestionType,
+      status: q.status,
+      text: q.text,
+      contentBlocks: q.contentBlocks as unknown[],
+      options: q.options as unknown[],
+      subject: q.subject,
+      concepts: q.concepts as string[],
+      prerequisites: q.prerequisites as string[],
+      hasTrap: q.hasTrap,
+      difficultyAi: q.difficultyAi,
+      sourceYear: q.sourceYear,
+      sourceSession: q.sourceSession,
+      sourceMajor: q.sourceMajor,
+      sourceLesson: q.sourceLesson,
+      sourceNumber: q.sourceNumber,
+      sourcePage: q.sourcePage,
+      createdAt: q.createdAt,
+      updatedAt: q.updatedAt,
+      answerKey: answerKeyRows[0]
+        ? {
+            correctOptionIndex: answerKeyRows[0].correctOptionIndex,
+            correctText: answerKeyRows[0].correctText,
+          }
+        : undefined,
+      explanations: explanationRows.map((e) => ({
+        origin: e.origin,
+        body: e.body,
+      })),
+      rubric: rubricRows.map((r) => ({
+        partKey: r.partKey,
+        maxScore: r.maxScore,
+        order: r.order,
+      })),
+    };
   }
 }

@@ -1,7 +1,7 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { IsEnum, IsInt, Min, ValidateNested } from 'class-validator';
 import { Type } from 'class-transformer';
-import { QuestionType } from '../../questions/schemas/question.schema';
+import { QuestionType } from '../../questions/enums/question-type.enum';
 
 export class CountsDto {
   @ApiProperty({ example: 2, description: 'Number of easy questions', minimum: 0 })
@@ -24,7 +24,7 @@ export class StartExamDto {
   @ApiProperty({
     enum: QuestionType,
     example: QuestionType.MULTIPLE_CHOICE,
-    description: 'multiple_choice or text_answer',
+    description: 'multiple_choice or descriptive (free-text essay)',
   })
   @IsEnum(QuestionType)
   questionType: QuestionType;

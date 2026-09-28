@@ -1,5 +1,8 @@
-import { UserDocument } from '../schemas/user.schema';
+import { UserWithProfile } from '../users.service';
 
+/**
+ * Outgoing user shape. Maps from account + student rows.
+ */
 export class UserResponseDto {
   id: string;
   nationalId: string;
@@ -14,20 +17,20 @@ export class UserResponseDto {
   createdAt: Date;
   updatedAt: Date;
 
-  static fromDocument(user: UserDocument): UserResponseDto {
-    return {
-      id: user._id.toString(),
-      nationalId: user.nationalId,
-      phoneNumber: user.phoneNumber,
-      firstName: user.firstName,
-      lastName: user.lastName,
-      role: user.role,
-      isActive: user.isActive,
-      xp: user.xp,
-      level: user.level,
-      streak: user.streak,
-      createdAt: user.createdAt,
-      updatedAt: user.updatedAt,
-    };
+  static fromDocument(user: UserWithProfile): UserResponseDto {
+    const dto = new UserResponseDto();
+    dto.id = user.id;
+    dto.nationalId = user.nationalId;
+    dto.phoneNumber = user.phoneNumber;
+    dto.firstName = user.firstName;
+    dto.lastName = user.lastName;
+    dto.role = user.role;
+    dto.isActive = user.isActive;
+    dto.xp = user.xp;
+    dto.level = user.level;
+    dto.streak = user.streak;
+    dto.createdAt = user.createdAt;
+    dto.updatedAt = user.updatedAt;
+    return dto;
   }
 }
