@@ -6,6 +6,7 @@ import { answerKey } from '../../db/schema/answer-key';
 import { explanation } from '../../db/schema/explanation';
 import { rubric } from '../../db/schema/rubric';
 import { topic } from '../../db/schema/topic';
+import { response } from '../../db/schema/response';
 import { eq, and, desc, sql, SQL } from 'drizzle-orm';
 import { QuestionType } from './enums/question-type.enum';
 import { CreateQuestionDto, UpdateQuestionDto } from './dto/question.dto';
@@ -118,7 +119,10 @@ export class QuestionsService {
     return this.getQuestionById(newQuestion.id);
   }
 
-  async getQuestions(filters: Record<string, unknown>): Promise<QuestionWithDetails[]> {
+  async getQuestions(
+    filters: Record<string, unknown>,
+    includeAnswerKey = true,
+  ): Promise<QuestionWithDetails[]> {
     const conditions: SQL<unknown>[] = [];
 
     if (filters.subject) {
@@ -143,10 +147,15 @@ export class QuestionsService {
       .orderBy(desc(question.createdAt))
       .limit(100);
 
-    return Promise.all(rows.map((q) => this.enrichQuestion(q)));
+    return Promise.all(
+      rows.map((q) => this.enrichQuestion(q, includeAnswerKey)),
+    );
   }
 
-  async getQuestionById(id: string): Promise<QuestionWithDetails> {
+  async getQuestionById(
+    id: string,
+    includeAnswerKey = true,
+  ): Promise<QuestionWithDetails> {
     const rows = await this.db
       .select()
       .from(question)
@@ -157,7 +166,7 @@ export class QuestionsService {
       throw new NotFoundException('Question not found');
     }
 
-    return this.enrichQuestion(rows[0]);
+    return this.enrichQuestion(rows[0], includeAnswerKey);
   }
 
   async updateQuestion(id: string, dto: UpdateQuestionDto): Promise<QuestionWithDetails> {
@@ -250,7 +259,7 @@ export class QuestionsService {
     return this.getQuestionById(id);
   }
 
-  async deleteQuestion(id: string): Promise<void> {
+  async deleteQuestion(id: string): Promise<'deleted' | 'archived'> {
     const existing = await this.db
       .select({ id: question.id })
       .from(question)
@@ -261,13 +270,33 @@ export class QuestionsService {
       throw new NotFoundException('Question not found');
     }
 
-    // Delete related records first (foreign keys with cascade should handle this)
+    // A question referenced by response rows is exam history and must
+    // survive: archive it instead of deleting (spec section 15,
+    // migration acceptance: relationships and history stay intact).
+    const used = await this.db
+      .select({ id: response.id })
+      .from(response)
+      .where(eq(response.questionId, id))
+      .limit(1);
+
+    if (used.length > 0) {
+      await this.db
+        .update(question)
+        .set({ status: 'archived', updatedAt: new Date() })
+        .where(eq(question.id, id));
+      return 'archived';
+    }
+
+    // Unused questions delete cleanly; answer_key, explanation and
+    // rubric rows cascade via foreign keys.
     await this.db.delete(question).where(eq(question.id, id));
+    return 'deleted';
   }
 
   async getRandomQuestions(
     count: number,
     filters: Record<string, unknown>,
+    includeAnswerKey = true,
   ): Promise<QuestionWithDetails[]> {
     const conditions: SQL<unknown>[] = [sql`${question.status} = 'published'`];
 
@@ -292,21 +321,30 @@ export class QuestionsService {
       .orderBy(sql`random()`)
       .limit(count);
 
-    return Promise.all(rows.map((q) => this.enrichQuestion(q)));
+    return Promise.all(
+      rows.map((q) => this.enrichQuestion(q, includeAnswerKey)),
+    );
   }
 
-  private async enrichQuestion(q: typeof question.$inferSelect): Promise<QuestionWithDetails> {
-    // Get answer key
-    const answerKeyRows = await this.db
-      .select()
-      .from(answerKey)
-      .where(
-        and(
-          eq(answerKey.questionId, q.id),
-          eq(answerKey.questionVersion, q.version),
-        ),
-      )
-      .limit(1);
+  private async enrichQuestion(
+    q: typeof question.$inferSelect,
+    includeAnswerKey = true,
+  ): Promise<QuestionWithDetails> {
+    // Answer keys stay server-side for students (spec section 13.2):
+    // only admins receive them. Students get content + rubric only.
+    const answerKeyRows: Array<typeof answerKey.$inferSelect> =
+      includeAnswerKey
+        ? await this.db
+            .select()
+            .from(answerKey)
+            .where(
+              and(
+                eq(answerKey.questionId, q.id),
+                eq(answerKey.questionVersion, q.version),
+              ),
+            )
+            .limit(1)
+        : [];
 
     // Get explanations
     const explanationRows = await this.db

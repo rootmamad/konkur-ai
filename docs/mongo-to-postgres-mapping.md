@@ -65,3 +65,23 @@ Mongo equivalent; they are new per spec sections 3.5 and 5.
   plain text, only as hashes.
 - JWT payload `{ sub, role }` is unchanged until the rewrite step,
   where `sub` becomes the account UUID and role derives from `is_admin`.
+
+## 5. Step 3 hardening (spec 13.2, 15)
+
+- `GET /questions`, `GET /questions/random`, `GET /questions/:id`
+  strip `answerKey` for students; admins keep full detail.
+  Correct answers are never sent during an attempt.
+- `DELETE /questions/:id` archives (status `archived`) when the
+  question is referenced by `response` rows; unused questions
+  delete cleanly with cascading key/explanation/rubric rows.
+- `POST /exams/start` uses a deterministic idempotency key per
+  student + exam instance, so a retry returns the same attempt
+  instead of creating a duplicate.
+- `POST /exams/:attemptId/answers` is idempotent on retry of the
+  same answer; only a changed answer appends a new row with an
+  incremented `attemptNumber`.
+- `POST /exams/:attemptId/finish` grades MCQ inline only.
+  Descriptive answers are never string-matched: they get
+  `is_correct = NULL` plus a `correction` row in `needs_review`
+  state, and the response reports `pendingDescriptive` until
+  rubric-based grading (step 5) lands.

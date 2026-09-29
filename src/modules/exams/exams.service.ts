@@ -1,14 +1,21 @@
-import { Injectable, Inject, NotFoundException, ForbiddenException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  Inject,
+  NotFoundException,
+  ForbiddenException,
+} from '@nestjs/common';
 import { DB } from '../../db/db.module';
 import type { Db } from '../../db/db.module';
 import { examTemplate } from '../../db/schema/exam';
 import { examInstance } from '../../db/schema/exam';
 import { attempt } from '../../db/schema/attempt';
 import { response } from '../../db/schema/response';
+import { correction } from '../../db/schema/correction';
 import { question } from '../../db/schema/question';
 import { student } from '../../db/schema/student';
 import { answerKey } from '../../db/schema/answer-key';
-import { eq, and, desc, sql, inArray } from 'drizzle-orm';
+import { eq, and, desc, sql } from 'drizzle-orm';
 import { QuestionType } from '../questions/enums/question-type.enum';
 import { StartExamDto } from './dto/start-exam.dto';
 import { SubmitAnswerDto } from './dto/submit-answer.dto';
@@ -56,7 +63,7 @@ export class ExamsService {
     // Build question selection criteria
     const totalCount = counts.easy + counts.normal + counts.hard;
     if (totalCount === 0) {
-      throw new Error('At least one question must be selected');
+      throw new BadRequestException('At least one question must be selected');
     }
 
     // Select random questions matching criteria
@@ -102,7 +109,7 @@ export class ExamsService {
     }
 
     if (selectedQuestions.length === 0) {
-      throw new Error('No questions found matching criteria');
+      throw new BadRequestException('No questions found matching criteria');
     }
 
     // Shuffle the selected questions
@@ -154,8 +161,25 @@ export class ExamsService {
 
     const instanceId = instance[0].id;
 
-    // Create attempt
-    const idempotencyKey = `exam-${studentId}-${instanceId}-${Date.now()}`;
+    // Idempotency key is deterministic per exam instance (spec
+    // section 15, acceptance: a dropped connection must not create
+    // a duplicate start or lose the saved response).
+    const idempotencyKey = `exam-${studentId}-${instanceId}`;
+    const existingAttempt = await this.db
+      .select({ id: attempt.id, startedAt: attempt.startedAt })
+      .from(attempt)
+      .where(eq(attempt.idempotencyKey, idempotencyKey))
+      .limit(1);
+
+    if (existingAttempt.length > 0) {
+      return {
+        attemptId: existingAttempt[0].id,
+        questionOrder: selectedQuestions.map((q) => q.id),
+        durationSeconds,
+        startedAt: existingAttempt[0].startedAt,
+      };
+    }
+
     const attemptResult = await this.db
       .insert(attempt)
       .values({
@@ -224,7 +248,7 @@ export class ExamsService {
 
     const questionOrder = instanceRows[0].questionOrder as string[];
     if (questionIndex < 0 || questionIndex >= questionOrder.length) {
-      throw new Error('Invalid question index');
+      throw new BadRequestException('Invalid question index');
     }
 
     const questionId = questionOrder[questionIndex];
@@ -255,23 +279,48 @@ export class ExamsService {
       .orderBy(desc(response.attemptNumber))
       .limit(1);
 
-    const nextAttemptNumber = existingResponse.length > 0
-      ? existingResponse[0].attemptNumber + 1
-      : 1;
+    // A retry of the same answer updates the row (idempotent save);
+    // only a genuinely different answer appends a new attempt row so
+    // first-try-on-fresh-question stays distinguishable (spec 7).
+    if (existingResponse.length > 0) {
+      const latest = await this.db
+        .select()
+        .from(response)
+        .where(eq(response.id, existingResponse[0].id))
+        .limit(1);
+      const sameSelected =
+        typeof answer === 'number' &&
+        latest[0].selectedOption === answer &&
+        latest[0].textAnswer === null;
+      const sameText =
+        typeof answer === 'string' &&
+        latest[0].textAnswer === answer &&
+        latest[0].selectedOption === null;
 
-    // Insert response
+      if (sameSelected || sameText) {
+        return;
+      }
+    }
+
+    const nextAttemptNumber =
+      existingResponse.length > 0 ? existingResponse[0].attemptNumber + 1 : 1;
+
     await this.db.insert(response).values({
       attemptId,
       questionId,
       questionVersion: questionRecord.version,
       selectedOption: typeof answer === 'number' ? answer : null,
       textAnswer: typeof answer === 'string' ? answer : null,
+      activeSeconds: 0,
       attemptNumber: nextAttemptNumber,
       answeredAt: new Date(),
     });
   }
 
-  async finishExam(attemptId: string, userId: string): Promise<{ totalScore: number }> {
+  async finishExam(
+    attemptId: string,
+    userId: string,
+  ): Promise<{ totalScore: number; pendingDescriptive: number }> {
     // Verify attempt belongs to user
     const studentRows = await this.db
       .select({ id: student.id })
@@ -307,10 +356,39 @@ export class ExamsService {
       .from(response)
       .where(eq(response.attemptId, attemptId));
 
-    // Grade responses
+    // Grade MCQ responses inline. Descriptive answers are never
+    // auto-graded by string match (spec section 6): they stay
+    // pending until rubric-based grading (step 5) or a human review
+    // writes a correction row. Scores here are placeholders only.
     let totalScore = 0;
+    let pendingDescriptive = 0;
 
     for (const resp of responses) {
+      if (resp.textAnswer !== null) {
+        pendingDescriptive += 1;
+        await this.db
+          .update(response)
+          .set({ isCorrect: null })
+          .where(eq(response.id, resp.id));
+
+        const existingCorrection = await this.db
+          .select({ id: correction.id })
+          .from(correction)
+          .where(eq(correction.responseId, resp.id))
+          .limit(1);
+
+        if (existingCorrection.length === 0) {
+          await this.db.insert(correction).values({
+            responseId: resp.id,
+            partScores: [],
+            totalScore: null,
+            status: 'needs_review',
+            modelVersion: null,
+          });
+        }
+        continue;
+      }
+
       // Get answer key
       const answerKeyRows = await this.db
         .select()
@@ -327,10 +405,11 @@ export class ExamsService {
         const ak = answerKeyRows[0];
         let isCorrect = false;
 
-        if (ak.correctOptionIndex !== null && resp.selectedOption !== null) {
+        if (
+          ak.correctOptionIndex !== null &&
+          resp.selectedOption !== null
+        ) {
           isCorrect = ak.correctOptionIndex === resp.selectedOption;
-        } else if (ak.correctText && resp.textAnswer) {
-          isCorrect = ak.correctText.trim().toLowerCase() === resp.textAnswer.trim().toLowerCase();
         }
 
         await this.db
@@ -354,7 +433,7 @@ export class ExamsService {
       })
       .where(eq(attempt.id, attemptId));
 
-    return { totalScore };
+    return { totalScore, pendingDescriptive };
   }
 
   async getExamAttempt(attemptId: string, userId: string): Promise<any> {
