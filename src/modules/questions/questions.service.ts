@@ -1,15 +1,20 @@
-import { Injectable, Inject, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Inject, Injectable, NotFoundException } from '@nestjs/common';
+import { and, desc, eq, sql, SQL } from 'drizzle-orm';
+
 import { DB } from '../../db/db.module';
 import type { Db } from '../../db/db.module';
+import type { DbOrTx } from '../../db/types';
 import { question } from '../../db/schema/question';
 import { answerKey } from '../../db/schema/answer-key';
 import { explanation } from '../../db/schema/explanation';
 import { rubric } from '../../db/schema/rubric';
 import { topic } from '../../db/schema/topic';
 import { response } from '../../db/schema/response';
-import { eq, and, desc, sql, SQL } from 'drizzle-orm';
 import { QuestionType } from './enums/question-type.enum';
 import { CreateQuestionDto, UpdateQuestionDto } from './dto/question.dto';
+import { QuestionListQueryDto, QuestionStatus, RandomQuestionsQueryDto } from './dto/question-query.dto';
+
+export type QuestionAudience = 'admin' | 'student';
 
 export interface QuestionWithDetails {
   id: string;
@@ -33,246 +38,182 @@ export interface QuestionWithDetails {
   sourcePage: number | null;
   createdAt: Date;
   updatedAt: Date;
-  answerKey?: {
-    correctOptionIndex: number | null;
-    correctText: string | null;
-  };
-  explanations?: Array<{
-    origin: string;
-    body: string;
-  }>;
-  rubric?: Array<{
-    partKey: string;
-    maxScore: string;
-    order: number;
-  }>;
+  answerKey?: { correctOptionIndex: number | null; correctText: string | null };
+  explanations?: Array<{ origin: string; body: string }>;
+  rubric: Array<{ partKey: string; maxScore: string; order: number }>;
 }
+
+type QuestionRow = typeof question.$inferSelect;
+
+/**
+ * Spec 4: extract -> review -> publish only approved, versioned.
+ * Until versioning lands, published content is immutable.
+ */
+const EDITABLE_STATUSES: ReadonlySet<QuestionStatus> = new Set(['draft', 'in_review']);
+const STATUS_TRANSITIONS: Record<QuestionStatus, readonly QuestionStatus[]> = {
+  draft: ['in_review'],
+  in_review: ['draft', 'published'],
+  published: ['archived'],
+  archived: [],
+};
 
 @Injectable()
 export class QuestionsService {
   constructor(@Inject(DB) private readonly db: Db) {}
 
   async createQuestion(dto: CreateQuestionDto): Promise<QuestionWithDetails> {
-    // Find or create topic
-    let topicId: string | null = null;
-    if (dto.topic) {
-      const existingTopic = await this.db
-        .select({ id: topic.id })
-        .from(topic)
-        .where(eq(topic.slug, dto.topic.toLowerCase().replace(/\s+/g, '-')))
-        .limit(1);
+    this.assertChoiceShape(dto.questionType, dto.options, dto.correctOptionIndex);
 
-      if (existingTopic.length > 0) {
-        topicId = existingTopic[0].id;
-      } else {
-        const newTopic = await this.db
-          .insert(topic)
-          .values({
-            slug: dto.topic.toLowerCase().replace(/\s+/g, '-'),
-            title: dto.topic,
-            parentId: null,
-          })
-          .returning({ id: topic.id });
-        topicId = newTopic[0].id;
+    const id = await this.db.transaction(async (tx) => {
+      const topicId = await this.resolveTopicId(tx, dto.topic);
+      const [created] = await tx
+        .insert(question)
+        .values({
+          topicId,
+          type: dto.questionType,
+          status: 'draft',
+          text: dto.text,
+          contentBlocks: [{ type: 'text', content: dto.text }],
+          options: this.toOptions(dto.options),
+          subject: dto.subject,
+          difficultyAi: dto.difficulty,
+        })
+        .returning({ id: question.id, version: question.version });
+
+      await tx.insert(answerKey).values({
+        questionId: created.id,
+        questionVersion: created.version,
+        correctOptionIndex: dto.correctOptionIndex ?? null,
+        correctText: null,
+      });
+
+      if (dto.explanation) {
+        await tx.insert(explanation).values({
+          questionId: created.id,
+          questionVersion: created.version,
+          origin: 'official',
+          body: dto.explanation,
+        });
       }
-    }
-
-    // Insert question - use sql template for enum
-    const questionResult = await this.db
-      .insert(question)
-      .values({
-        topicId,
-        type: dto.questionType as 'multiple_choice' | 'true_false' | 'fill_blank' | 'descriptive' | 'multi_part',
-        status: 'published',
-        text: dto.text,
-        contentBlocks: [{ type: 'text', content: dto.text }],
-        options: dto.options ? dto.options.map((opt, idx) => ({ index: idx, text: opt })) : [],
-        subject: dto.subject,
-        concepts: [],
-        prerequisites: [],
-        hasTrap: false,
-        difficultyAi: dto.difficulty,
-      })
-      .returning();
-
-    const newQuestion = questionResult[0];
-
-    // Insert answer key
-    await this.db.insert(answerKey).values({
-      questionId: newQuestion.id,
-      questionVersion: newQuestion.version,
-      correctOptionIndex: dto.correctOptionIndex ?? null,
-      correctText: null,
+      return created.id;
     });
 
-    // Insert explanation if provided
-    if (dto.explanation) {
-      await this.db.insert(explanation).values({
-        questionId: newQuestion.id,
-        questionVersion: newQuestion.version,
-        origin: 'official',
-        body: dto.explanation,
-      });
-    }
-
-    // Return with details
-    return this.getQuestionById(newQuestion.id);
+    return this.getQuestionById(id, 'admin');
   }
 
-  async getQuestions(
-    filters: Record<string, unknown>,
-    includeAnswerKey = true,
-  ): Promise<QuestionWithDetails[]> {
-    const conditions: SQL<unknown>[] = [];
-
-    if (filters.subject) {
-      conditions.push(eq(question.subject, filters.subject as string));
-    }
-    if (filters.type) {
-      conditions.push(sql`${question.type} = ${filters.type as string}`);
-    }
-    if (filters.status) {
-      conditions.push(sql`${question.status} = ${filters.status as string}`);
-    }
-    if (filters.topicId) {
-      conditions.push(eq(question.topicId, filters.topicId as string));
-    }
-
-    const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+  async getQuestions(query: QuestionListQueryDto, audience: QuestionAudience): Promise<QuestionWithDetails[]> {
+    const conditions = this.buildFilters(query);
+    const status = audience === 'student' ? 'published' : query.status;
+    if (status) conditions.push(eq(question.status, status));
 
     const rows = await this.db
       .select()
       .from(question)
-      .where(whereClause)
+      .where(conditions.length ? and(...conditions) : undefined)
       .orderBy(desc(question.createdAt))
       .limit(100);
 
-    return Promise.all(
-      rows.map((q) => this.enrichQuestion(q, includeAnswerKey)),
-    );
+    return Promise.all(rows.map((q) => this.enrichQuestion(q, audience)));
   }
 
-  async getQuestionById(
-    id: string,
-    includeAnswerKey = true,
-  ): Promise<QuestionWithDetails> {
+  async getQuestionById(id: string, audience: QuestionAudience): Promise<QuestionWithDetails> {
+    const conditions: SQL[] = [eq(question.id, id)];
+    // Students only ever see published content (no draft/archived leak).
+    if (audience === 'student') conditions.push(eq(question.status, 'published'));
+
+    const [row] = await this.db.select().from(question).where(and(...conditions)).limit(1);
+    if (!row) throw new NotFoundException('Question not found');
+    return this.enrichQuestion(row, audience);
+  }
+
+  async getRandomQuestions(query: RandomQuestionsQueryDto, audience: QuestionAudience): Promise<QuestionWithDetails[]> {
+    const conditions = this.buildFilters(query);
+    conditions.push(eq(question.status, 'published'));
+    if (query.difficulty !== undefined) conditions.push(eq(question.difficultyAi, query.difficulty));
+
     const rows = await this.db
       .select()
       .from(question)
-      .where(eq(question.id, id))
-      .limit(1);
+      .where(and(...conditions))
+      .orderBy(sql`random()`)
+      .limit(query.count);
 
-    if (rows.length === 0) {
-      throw new NotFoundException('Question not found');
-    }
-
-    return this.enrichQuestion(rows[0], includeAnswerKey);
+    return Promise.all(rows.map((q) => this.enrichQuestion(q, audience)));
   }
 
   async updateQuestion(id: string, dto: UpdateQuestionDto): Promise<QuestionWithDetails> {
-    const existing = await this.db
-      .select()
-      .from(question)
-      .where(eq(question.id, id))
-      .limit(1);
-
-    if (existing.length === 0) {
-      throw new NotFoundException('Question not found');
+    const existing = await this.requireQuestion(id);
+    if (!EDITABLE_STATUSES.has(existing.status)) {
+      throw new ConflictException(
+        'Published or archived questions are immutable until question versioning is implemented',
+      );
     }
+    this.assertChoiceShape(
+      dto.questionType ?? (existing.type as QuestionType),
+      dto.options ?? (existing.options as Array<{ text: string }>).map((o) => o.text),
+      dto.correctOptionIndex,
+    );
 
-    const updateData: Record<string, unknown> = { updatedAt: new Date() };
-
-    if (dto.text !== undefined) {
-      updateData.text = dto.text;
-      updateData.contentBlocks = [{ type: 'text', content: dto.text }];
-    }
-    if (dto.options !== undefined) {
-      updateData.options = dto.options.map((opt, idx) => ({ index: idx, text: opt }));
-    }
-    if (dto.subject !== undefined) {
-      updateData.subject = dto.subject;
-    }
-    if (dto.topic !== undefined) {
-      let topicId: string | null = null;
-      if (dto.topic) {
-        const existingTopic = await this.db
-          .select({ id: topic.id })
-          .from(topic)
-          .where(eq(topic.slug, dto.topic.toLowerCase().replace(/\s+/g, '-')))
-          .limit(1);
-
-        if (existingTopic.length > 0) {
-          topicId = existingTopic[0].id;
-        } else {
-          const newTopic = await this.db
-            .insert(topic)
-            .values({
-              slug: dto.topic.toLowerCase().replace(/\s+/g, '-'),
-              title: dto.topic,
-              parentId: null,
-            })
-            .returning({ id: topic.id });
-          topicId = newTopic[0].id;
-        }
+    await this.db.transaction(async (tx) => {
+      const changes: Partial<typeof question.$inferInsert> = { updatedAt: new Date() };
+      if (dto.text !== undefined) {
+        changes.text = dto.text;
+        changes.contentBlocks = [{ type: 'text', content: dto.text }];
       }
-      updateData.topicId = topicId;
+      if (dto.options !== undefined) changes.options = this.toOptions(dto.options);
+      if (dto.subject !== undefined) changes.subject = dto.subject;
+      if (dto.topic !== undefined) changes.topicId = await this.resolveTopicId(tx, dto.topic);
+      if (dto.difficulty !== undefined) changes.difficultyAi = dto.difficulty;
+      if (dto.questionType !== undefined) changes.type = dto.questionType;
+
+      await tx.update(question).set(changes).where(eq(question.id, id));
+
+      if (dto.correctOptionIndex !== undefined) {
+        await tx
+          .update(answerKey)
+          .set({ correctOptionIndex: dto.correctOptionIndex })
+          .where(and(eq(answerKey.questionId, id), eq(answerKey.questionVersion, existing.version)));
+      }
+      if (dto.explanation !== undefined) {
+        await tx
+          .update(explanation)
+          .set({ body: dto.explanation })
+          .where(
+            and(
+              eq(explanation.questionId, id),
+              eq(explanation.questionVersion, existing.version),
+              eq(explanation.origin, 'official'),
+            ),
+          );
+      }
+    });
+
+    return this.getQuestionById(id, 'admin');
+  }
+
+  async updateStatus(id: string, next: QuestionStatus): Promise<QuestionWithDetails> {
+    const existing = await this.requireQuestion(id);
+    if (!STATUS_TRANSITIONS[existing.status].includes(next)) {
+      throw new ConflictException(`Cannot move question from "${existing.status}" to "${next}"`);
     }
-    if (dto.difficulty !== undefined) {
-      updateData.difficultyAi = dto.difficulty;
-    }
-    if (dto.questionType !== undefined) {
-      updateData.type = dto.questionType as 'multiple_choice' | 'true_false' | 'fill_blank' | 'descriptive' | 'multi_part';
+    if (next === 'published' && existing.type === QuestionType.MULTIPLE_CHOICE) {
+      const [key] = await this.db
+        .select({ correctOptionIndex: answerKey.correctOptionIndex })
+        .from(answerKey)
+        .where(and(eq(answerKey.questionId, id), eq(answerKey.questionVersion, existing.version)))
+        .limit(1);
+      if (key?.correctOptionIndex == null) {
+        throw new BadRequestException('A multiple-choice question needs an answer key before publishing');
+      }
     }
 
-    await this.db
-      .update(question)
-      .set(updateData)
-      .where(eq(question.id, id));
-
-    // Update answer key if provided
-    if (dto.correctOptionIndex !== undefined) {
-      await this.db
-        .update(answerKey)
-        .set({ correctOptionIndex: dto.correctOptionIndex })
-        .where(
-          and(
-            eq(answerKey.questionId, id),
-            eq(answerKey.questionVersion, existing[0].version),
-          ),
-        );
-    }
-
-    // Update explanation if provided
-    if (dto.explanation !== undefined) {
-      await this.db
-        .update(explanation)
-        .set({ body: dto.explanation })
-        .where(
-          and(
-            eq(explanation.questionId, id),
-            eq(explanation.questionVersion, existing[0].version),
-            eq(explanation.origin, 'official'),
-          ),
-        );
-    }
-
-    return this.getQuestionById(id);
+    await this.db.update(question).set({ status: next, updatedAt: new Date() }).where(eq(question.id, id));
+    return this.getQuestionById(id, 'admin');
   }
 
   async deleteQuestion(id: string): Promise<'deleted' | 'archived'> {
-    const existing = await this.db
-      .select({ id: question.id })
-      .from(question)
-      .where(eq(question.id, id))
-      .limit(1);
+    await this.requireQuestion(id);
 
-    if (existing.length === 0) {
-      throw new NotFoundException('Question not found');
-    }
-
-    // A question referenced by response rows is exam history and must
-    // survive: archive it instead of deleting (spec section 15,
-    // migration acceptance: relationships and history stay intact).
     const used = await this.db
       .select({ id: response.id })
       .from(response)
@@ -280,89 +221,76 @@ export class QuestionsService {
       .limit(1);
 
     if (used.length > 0) {
-      await this.db
-        .update(question)
-        .set({ status: 'archived', updatedAt: new Date() })
-        .where(eq(question.id, id));
+      await this.db.update(question).set({ status: 'archived', updatedAt: new Date() }).where(eq(question.id, id));
       return 'archived';
     }
 
-    // Unused questions delete cleanly; answer_key, explanation and
-    // rubric rows cascade via foreign keys.
     await this.db.delete(question).where(eq(question.id, id));
     return 'deleted';
   }
 
-  async getRandomQuestions(
-    count: number,
-    filters: Record<string, unknown>,
-    includeAnswerKey = true,
-  ): Promise<QuestionWithDetails[]> {
-    const conditions: SQL<unknown>[] = [sql`${question.status} = 'published'`];
-
-    if (filters.subject) {
-      conditions.push(eq(question.subject, filters.subject as string));
-    }
-    if (filters.type) {
-      conditions.push(sql`${question.type} = ${filters.type as string}`);
-    }
-    if (filters.topicId) {
-      conditions.push(eq(question.topicId, filters.topicId as string));
-    }
-    if (filters.difficulty) {
-      conditions.push(eq(question.difficultyAi, filters.difficulty as number));
-    }
-
-    // Use PostgreSQL's random() for random selection
-    const rows = await this.db
-      .select()
-      .from(question)
-      .where(and(...conditions))
-      .orderBy(sql`random()`)
-      .limit(count);
-
-    return Promise.all(
-      rows.map((q) => this.enrichQuestion(q, includeAnswerKey)),
-    );
+  private async requireQuestion(id: string): Promise<QuestionRow> {
+    const [row] = await this.db.select().from(question).where(eq(question.id, id)).limit(1);
+    if (!row) throw new NotFoundException('Question not found');
+    return row;
   }
 
-  private async enrichQuestion(
-    q: typeof question.$inferSelect,
-    includeAnswerKey = true,
-  ): Promise<QuestionWithDetails> {
-    // Answer keys stay server-side for students (spec section 13.2):
-    // only admins receive them. Students get content + rubric only.
-    const answerKeyRows: Array<typeof answerKey.$inferSelect> =
-      includeAnswerKey
-        ? await this.db
+  private buildFilters(query: Pick<QuestionListQueryDto, 'subject' | 'type' | 'topicId'>): SQL[] {
+    const conditions: SQL[] = [];
+    if (query.subject) conditions.push(eq(question.subject, query.subject));
+    if (query.type) conditions.push(eq(question.type, query.type));
+    if (query.topicId) conditions.push(eq(question.topicId, query.topicId));
+    return conditions;
+  }
+
+  private assertChoiceShape(type: QuestionType, options?: string[], correctIndex?: number): void {
+    if (type !== QuestionType.MULTIPLE_CHOICE) return;
+    if (!options || options.length < 2) {
+      throw new BadRequestException('Multiple-choice questions need at least 2 options');
+    }
+    if (correctIndex !== undefined && correctIndex >= options.length) {
+      throw new BadRequestException('correctOptionIndex is out of range');
+    }
+  }
+
+  private toOptions(options?: string[]) {
+    return (options ?? []).map((text, index) => ({ index, text }));
+  }
+
+  private async resolveTopicId(executor: DbOrTx, title: string): Promise<string | null> {
+    if (!title) return null;
+    const slug = title.toLowerCase().trim().replace(/\s+/g, '-');
+    const [found] = await executor.select({ id: topic.id }).from(topic).where(eq(topic.slug, slug)).limit(1);
+    if (found) return found.id;
+
+    const [created] = await executor
+      .insert(topic)
+      .values({ slug, title, parentId: null })
+      .returning({ id: topic.id });
+    return created.id;
+  }
+
+  private async enrichQuestion(q: QuestionRow, audience: QuestionAudience): Promise<QuestionWithDetails> {
+    const isAdmin = audience === 'admin';
+
+    // Answer key AND explanations stay server-side for students:
+    // official explanations usually contain the answer (spec 13.2).
+    const [keyRows, explanationRows, rubricRows] = await Promise.all([
+      isAdmin
+        ? this.db
             .select()
             .from(answerKey)
-            .where(
-              and(
-                eq(answerKey.questionId, q.id),
-                eq(answerKey.questionVersion, q.version),
-              ),
-            )
+            .where(and(eq(answerKey.questionId, q.id), eq(answerKey.questionVersion, q.version)))
             .limit(1)
-        : [];
-
-    // Get explanations
-    const explanationRows = await this.db
-      .select()
-      .from(explanation)
-      .where(
-        and(
-          eq(explanation.questionId, q.id),
-          eq(explanation.questionVersion, q.version),
-        ),
-      );
-
-    // Get rubric
-    const rubricRows = await this.db
-      .select()
-      .from(rubric)
-      .where(eq(rubric.questionId, q.id))
-      .orderBy(rubric.order);
+        : Promise.resolve([]),
+      isAdmin
+        ? this.db
+            .select()
+            .from(explanation)
+            .where(and(eq(explanation.questionId, q.id), eq(explanation.questionVersion, q.version)))
+        : Promise.resolve([]),
+      this.db.select().from(rubric).where(eq(rubric.questionId, q.id)).orderBy(rubric.order),
+    ]);
 
     return {
       id: q.id,
@@ -386,21 +314,13 @@ export class QuestionsService {
       sourcePage: q.sourcePage,
       createdAt: q.createdAt,
       updatedAt: q.updatedAt,
-      answerKey: answerKeyRows[0]
-        ? {
-            correctOptionIndex: answerKeyRows[0].correctOptionIndex,
-            correctText: answerKeyRows[0].correctText,
-          }
-        : undefined,
-      explanations: explanationRows.map((e) => ({
-        origin: e.origin,
-        body: e.body,
-      })),
-      rubric: rubricRows.map((r) => ({
-        partKey: r.partKey,
-        maxScore: r.maxScore,
-        order: r.order,
-      })),
+      ...(isAdmin && {
+        answerKey: keyRows[0]
+          ? { correctOptionIndex: keyRows[0].correctOptionIndex, correctText: keyRows[0].correctText }
+          : undefined,
+        explanations: explanationRows.map((e) => ({ origin: e.origin, body: e.body })),
+      }),
+      rubric: rubricRows.map((r) => ({ partKey: r.partKey, maxScore: r.maxScore, order: r.order })),
     };
   }
 }

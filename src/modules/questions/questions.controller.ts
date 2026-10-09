@@ -1,92 +1,65 @@
-import {
-  Body,
-  Controller,
-  Delete,
-  Get,
-  Param,
-  Patch,
-  Post,
-  Query,
-  UseGuards,
-} from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, ParseUUIDPipe, Patch, Post, Query, UseGuards } from '@nestjs/common';
+import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { Roles } from '../../common/decorators/roles.decorator';
-import { UserRole } from '../users/enums/user-role.enum';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import type { AuthenticatedUser } from '../../common/decorators/current-user.decorator';
-import { QuestionsService } from './questions.service';
-import {
-  CreateQuestionDto,
-  UpdateQuestionDto,
-} from './dto/question.dto';
+import { UserRole } from '../users/enums/user-role.enum';
+import { QuestionAudience, QuestionsService } from './questions.service';
+import { CreateQuestionDto, UpdateQuestionDto } from './dto/question.dto';
+import { QuestionListQueryDto, RandomQuestionsQueryDto, UpdateQuestionStatusDto } from './dto/question-query.dto';
 
+const audienceOf = (user: AuthenticatedUser): QuestionAudience =>
+  user.role === UserRole.ADMIN ? 'admin' : 'student';
+
+@ApiTags('questions')
+@ApiBearerAuth('access-token')
 @Controller('questions')
+@UseGuards(JwtAuthGuard, RolesGuard)
 export class QuestionsController {
   constructor(private readonly questionsService: QuestionsService) {}
 
   @Get()
-  @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.STUDENT)
-  getQuestions(
-    @Query() filters: Record<string, unknown>,
-    @CurrentUser() user: AuthenticatedUser,
-  ) {
-    // Students never receive correct answers (spec section 13.2);
-    // admins keep full detail for the review queue.
-    const isAdmin = user.role === UserRole.ADMIN;
-    return this.questionsService.getQuestions(filters, isAdmin);
+  getQuestions(@Query() query: QuestionListQueryDto, @CurrentUser() user: AuthenticatedUser) {
+    return this.questionsService.getQuestions(query, audienceOf(user));
   }
 
   @Get('random')
-  @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.STUDENT)
-  getRandomQuestions(
-    @Query('count') count = 10,
-    @Query() filters: Record<string, unknown>,
-    @CurrentUser() user: AuthenticatedUser,
-  ) {
-    const { count: _ignored, ...filterCriteria } = filters;
-    const isAdmin = user.role === UserRole.ADMIN;
-    return this.questionsService.getRandomQuestions(
-      Number(count),
-      filterCriteria,
-      isAdmin,
-    );
+  getRandomQuestions(@Query() query: RandomQuestionsQueryDto, @CurrentUser() user: AuthenticatedUser) {
+    return this.questionsService.getRandomQuestions(query, audienceOf(user));
   }
 
   @Get(':id')
-  @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.STUDENT)
-  getQuestionById(
-    @Param('id') id: string,
-    @CurrentUser() user: AuthenticatedUser,
-  ) {
-    const isAdmin = user.role === UserRole.ADMIN;
-    return this.questionsService.getQuestionById(id, isAdmin);
+  getQuestionById(@Param('id', ParseUUIDPipe) id: string, @CurrentUser() user: AuthenticatedUser) {
+    return this.questionsService.getQuestionById(id, audienceOf(user));
   }
 
   @Post()
-  @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN)
   createQuestion(@Body() dto: CreateQuestionDto) {
     return this.questionsService.createQuestion(dto);
   }
 
   @Patch(':id')
-  @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN)
-  updateQuestion(@Param('id') id: string, @Body() dto: UpdateQuestionDto) {
+  updateQuestion(@Param('id', ParseUUIDPipe) id: string, @Body() dto: UpdateQuestionDto) {
     return this.questionsService.updateQuestion(id, dto);
   }
 
-  @Delete(':id')
-  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Patch(':id/status')
   @Roles(UserRole.ADMIN)
-  async deleteQuestion(@Param('id') id: string) {
-    // Questions used in an attempt are exam history: they are
-    // archived, not deleted. Unused ones delete cleanly.
+  updateStatus(@Param('id', ParseUUIDPipe) id: string, @Body() dto: UpdateQuestionStatusDto) {
+    return this.questionsService.updateStatus(id, dto.status);
+  }
+
+  @Delete(':id')
+  @Roles(UserRole.ADMIN)
+  async deleteQuestion(@Param('id', ParseUUIDPipe) id: string) {
     const result = await this.questionsService.deleteQuestion(id);
     return result === 'archived'
       ? { message: 'Question archived: it is used in exam history' }
