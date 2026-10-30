@@ -1,5 +1,20 @@
-import { BadRequestException, Body, Controller, Get, Headers, Param, ParseUUIDPipe, Post, UseGuards } from '@nestjs/common';
-import { ApiBearerAuth, ApiHeader, ApiOperation, ApiTags } from '@nestjs/swagger';
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Get,
+  Headers,
+  Param,
+  ParseUUIDPipe,
+  Post,
+  UseGuards,
+} from '@nestjs/common';
+import {
+  ApiBearerAuth,
+  ApiHeader,
+  ApiOperation,
+  ApiTags,
+} from '@nestjs/swagger';
 import { isUUID } from 'class-validator';
 
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
@@ -22,7 +37,11 @@ export class ExamsController {
 
   @Post('start')
   @ApiOperation({ summary: 'Start (or safely retry starting) an exam attempt' })
-  @ApiHeader({ name: 'Idempotency-Key', required: true, description: 'Client-generated UUID, reused on retries of the same start' })
+  @ApiHeader({
+    name: 'Idempotency-Key',
+    required: true,
+    description: 'Client-generated UUID, reused on retries of the same start',
+  })
   startExam(
     @CurrentUser() user: AuthenticatedUser,
     @Headers('idempotency-key') idempotencyKey: string | undefined,
@@ -41,17 +60,28 @@ export class ExamsController {
     @CurrentUser() user: AuthenticatedUser,
     @Body() body: SubmitAnswerDto,
   ) {
-    await this.examsService.submitAnswer(attemptId, user.userId, body.questionIndex, body.answer);
+    await this.examsService.submitAnswer(
+      attemptId,
+      user.userId,
+      body.questionIndex,
+      body.answer,
+    );
     return { message: 'Answer saved' };
   }
 
   @Post(':attemptId/finish')
-  finishExam(@Param('attemptId', ParseUUIDPipe) attemptId: string, @CurrentUser() user: AuthenticatedUser) {
+  finishExam(
+    @Param('attemptId', ParseUUIDPipe) attemptId: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
     return this.examsService.finishExam(attemptId, user.userId);
   }
 
   @Get(':attemptId')
-  getExamAttempt(@Param('attemptId', ParseUUIDPipe) attemptId: string, @CurrentUser() user: AuthenticatedUser) {
+  getExamAttempt(
+    @Param('attemptId', ParseUUIDPipe) attemptId: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
     return this.examsService.getExamAttempt(attemptId, user.userId);
   }
 

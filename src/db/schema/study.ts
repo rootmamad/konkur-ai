@@ -22,10 +22,7 @@ export const studyActivity = pgEnum('study_activity', [
   'teaching',
 ]);
 
-export const studyFeeling = pgEnum('study_feeling', [
-  'clear',
-  'vague',
-]);
+export const studyFeeling = pgEnum('study_feeling', ['clear', 'vague']);
 
 /**
  * Study entries from form, chat confirm or repeat-yesterday
@@ -43,9 +40,7 @@ export const studyLog = pgTable('study_log', {
   topic: text('topic'),
   activity: studyActivity('activity'),
   minutes: integer('minutes').notNull(),
-  doneAt: timestamp('done_at', { withTimezone: true })
-    .notNull()
-    .defaultNow(),
+  doneAt: timestamp('done_at', { withTimezone: true }).notNull().defaultNow(),
   exerciseCount: integer('exercise_count'),
   result: text('result'),
   source: text('source'),

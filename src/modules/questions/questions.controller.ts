@@ -1,4 +1,15 @@
-import { Body, Controller, Delete, Get, Param, ParseUUIDPipe, Patch, Post, Query, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Param,
+  ParseUUIDPipe,
+  Patch,
+  Post,
+  Query,
+  UseGuards,
+} from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
@@ -9,7 +20,11 @@ import type { AuthenticatedUser } from '../../common/decorators/current-user.dec
 import { UserRole } from '../users/enums/user-role.enum';
 import { QuestionAudience, QuestionsService } from './questions.service';
 import { CreateQuestionDto, UpdateQuestionDto } from './dto/question.dto';
-import { QuestionListQueryDto, RandomQuestionsQueryDto, UpdateQuestionStatusDto } from './dto/question-query.dto';
+import {
+  QuestionListQueryDto,
+  RandomQuestionsQueryDto,
+  UpdateQuestionStatusDto,
+} from './dto/question-query.dto';
 
 const audienceOf = (user: AuthenticatedUser): QuestionAudience =>
   user.role === UserRole.ADMIN ? 'admin' : 'student';
@@ -23,19 +38,28 @@ export class QuestionsController {
 
   @Get()
   @Roles(UserRole.ADMIN, UserRole.STUDENT)
-  getQuestions(@Query() query: QuestionListQueryDto, @CurrentUser() user: AuthenticatedUser) {
+  getQuestions(
+    @Query() query: QuestionListQueryDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
     return this.questionsService.getQuestions(query, audienceOf(user));
   }
 
   @Get('random')
   @Roles(UserRole.ADMIN, UserRole.STUDENT)
-  getRandomQuestions(@Query() query: RandomQuestionsQueryDto, @CurrentUser() user: AuthenticatedUser) {
+  getRandomQuestions(
+    @Query() query: RandomQuestionsQueryDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
     return this.questionsService.getRandomQuestions(query, audienceOf(user));
   }
 
   @Get(':id')
   @Roles(UserRole.ADMIN, UserRole.STUDENT)
-  getQuestionById(@Param('id', ParseUUIDPipe) id: string, @CurrentUser() user: AuthenticatedUser) {
+  getQuestionById(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
     return this.questionsService.getQuestionById(id, audienceOf(user));
   }
 
@@ -47,13 +71,19 @@ export class QuestionsController {
 
   @Patch(':id')
   @Roles(UserRole.ADMIN)
-  updateQuestion(@Param('id', ParseUUIDPipe) id: string, @Body() dto: UpdateQuestionDto) {
+  updateQuestion(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateQuestionDto,
+  ) {
     return this.questionsService.updateQuestion(id, dto);
   }
 
   @Patch(':id/status')
   @Roles(UserRole.ADMIN)
-  updateStatus(@Param('id', ParseUUIDPipe) id: string, @Body() dto: UpdateQuestionStatusDto) {
+  updateStatus(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateQuestionStatusDto,
+  ) {
     return this.questionsService.updateStatus(id, dto.status);
   }
 

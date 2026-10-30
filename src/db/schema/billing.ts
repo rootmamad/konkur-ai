@@ -61,12 +61,8 @@ export const quotaUsage = pgTable('quota_usage', {
 
 export const referral = pgTable('referral', {
   id: uuid('id').primaryKey().defaultRandom(),
-  inviterStudentId: uuid('inviter_student_id').references(
-    () => student.id,
-  ),
-  inviteeStudentId: uuid('invitee_student_id').references(
-    () => student.id,
-  ),
+  inviterStudentId: uuid('inviter_student_id').references(() => student.id),
+  inviteeStudentId: uuid('invitee_student_id').references(() => student.id),
   inviteCodeUsed: text('invite_code_used').notNull(),
   stage: referralStage('stage').notNull().default('registered'),
   createdAt: timestamp('created_at', { withTimezone: true })

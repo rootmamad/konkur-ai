@@ -1,4 +1,3 @@
-
 export interface AIModelConfig {
   model: string;
   baseUrl: string;
@@ -12,7 +11,7 @@ export interface AIModelConfig {
 export const AI_MODELS = {
   gemini: {
     label: 'Gemini 3.6 Flash',
-    model: 'gemini-3.6-flash',                 // ← اسم دقیق مدل رو اینجا بذار
+    model: 'gemini-3.6-flash', // ← اسم دقیق مدل رو اینجا بذار
     baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
     apiKeysEnv: 'GEMINI_API_KEYS',
     temperature: 0.3,

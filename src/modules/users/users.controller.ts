@@ -18,7 +18,6 @@ import type { AuthenticatedUser } from '../../common/decorators/current-user.dec
 export class UsersController {
   constructor(private readonly usersService: UsersService) {}
 
-
   @Get()
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN)

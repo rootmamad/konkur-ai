@@ -1,6 +1,4 @@
 import {
-  ArrayMaxSize,
-  ArrayMinSize,
   IsArray,
   IsEnum,
   IsInt,
@@ -49,7 +47,6 @@ export class CreateQuestionDto {
   @IsEnum(QuestionType)
   questionType: QuestionType;
 }
-
 export class UpdateQuestionDto {
   @IsString()
   @IsOptional()

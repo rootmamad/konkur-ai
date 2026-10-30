@@ -2,11 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
 import { firstValueFrom } from 'rxjs';
-import {
-  AI_MODELS,
-  AIModelName,
-  DEFAULT_AI_MODEL,
-} from './ai-models';
+import { AI_MODELS, AIModelName, DEFAULT_AI_MODEL } from './ai-models';
 
 @Injectable()
 export class AIService {
@@ -54,7 +50,7 @@ export class AIService {
         this.http.post(`${cfg.baseUrl}/chat/completions`, body, {
           headers: {
             Authorization: `Bearer ${key}`,
-            'Content-Type': 'application/json'
+            'Content-Type': 'application/json',
           },
           timeout: 60_000,
         }),

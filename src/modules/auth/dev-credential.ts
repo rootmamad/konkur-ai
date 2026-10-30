@@ -1,5 +1,3 @@
-
-
 /**
  * Dev-only credential (spec section 2). The national code acts as a
  * password stand-in until the real auth method is decided (spec 15.2).

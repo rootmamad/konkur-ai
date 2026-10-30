@@ -1,4 +1,12 @@
-import { boolean, integer, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import {
+  boolean,
+  integer,
+  pgTable,
+  text,
+  timestamp,
+  uniqueIndex,
+  uuid,
+} from 'drizzle-orm/pg-core';
 
 import { attempt } from './attempt';
 import { question } from './question';
@@ -13,8 +21,12 @@ export const response = pgTable(
   'response',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    attemptId: uuid('attempt_id').notNull().references(() => attempt.id, { onDelete: 'cascade' }),
-    questionId: uuid('question_id').notNull().references(() => question.id),
+    attemptId: uuid('attempt_id')
+      .notNull()
+      .references(() => attempt.id, { onDelete: 'cascade' }),
+    questionId: uuid('question_id')
+      .notNull()
+      .references(() => question.id),
     questionVersion: integer('question_version').notNull(),
     selectedOption: integer('selected_option'),
     textAnswer: text('text_answer'),
@@ -22,9 +34,13 @@ export const response = pgTable(
     attemptNumber: integer('attempt_number').notNull().default(1),
     isCorrect: boolean('is_correct'),
     answeredAt: timestamp('answered_at', { withTimezone: true }),
-    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
   },
-  (t) => [uniqueIndex('response_attempt_question_uq').on(t.attemptId, t.questionId)],
+  (t) => [
+    uniqueIndex('response_attempt_question_uq').on(t.attemptId, t.questionId),
+  ],
 );
 
 export type Response = typeof response.$inferSelect;

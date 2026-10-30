@@ -8,6 +8,27 @@
       "when": 1790537214514,
       "tag": "0000_powerful_zaran",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1793381935431,
+      "tag": "0001_acoustic_silver_sable",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1793385195669,
+      "tag": "0002_thankful_iron_lad",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1793393756881,
+      "tag": "0003_dashing_old_lace",
+      "breakpoints": true
     }
   ]
 }

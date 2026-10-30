@@ -1,5 +1,6 @@
 export * from './account';
 export * from './student';
+export * from './question-mastery';
 export * from './advisor';
 export * from './advisor-student';
 export * from './topic';

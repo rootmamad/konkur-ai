@@ -75,9 +75,13 @@ export class UsersService {
     return rows[0] ? this.toUser(rows[0]) : null;
   }
 
-  async findByPhoneNumber(phoneNumber: string): Promise<UserWithProfile | null> {
+  async findByPhoneNumber(
+    phoneNumber: string,
+  ): Promise<UserWithProfile | null> {
     const rows = await this.baseQuery()
-      .where(and(eq(account.mobile, phoneNumber.trim()), eq(account.isActive, true)))
+      .where(
+        and(eq(account.mobile, phoneNumber.trim()), eq(account.isActive, true)),
+      )
       .limit(1);
     return rows[0] ? this.toUser(rows[0]) : null;
   }
@@ -97,7 +101,12 @@ export class UsersService {
         const taken = await tx
           .select({ id: account.id })
           .from(account)
-          .where(or(eq(account.mobile, mobile), eq(account.passwordHash, credentialHash)))
+          .where(
+            or(
+              eq(account.mobile, mobile),
+              eq(account.passwordHash, credentialHash),
+            ),
+          )
           .limit(1);
         if (taken.length > 0) {
           throw new ConflictException(REGISTRATION_FAILED);

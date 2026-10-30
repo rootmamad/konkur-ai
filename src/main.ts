@@ -13,7 +13,10 @@ function setupSwagger(app: Awaited<ReturnType<typeof NestFactory.create>>) {
     .setTitle('Konkur AI API')
     .setDescription('API documentation for Konkur AI')
     .setVersion('1.0')
-    .addBearerAuth({ type: 'http', scheme: 'bearer', bearerFormat: 'JWT', in: 'header' }, 'access-token')
+    .addBearerAuth(
+      { type: 'http', scheme: 'bearer', bearerFormat: 'JWT', in: 'header' },
+      'access-token',
+    )
     .build();
 
   const document = SwaggerModule.createDocument(app, config);
@@ -22,7 +25,9 @@ function setupSwagger(app: Awaited<ReturnType<typeof NestFactory.create>>) {
     const operation = document.paths?.[op.path]?.[op.method];
     if (operation) operation.security = [];
   }
-  SwaggerModule.setup('api-docs', app, document, { swaggerOptions: { persistAuthorization: true } });
+  SwaggerModule.setup('api-docs', app, document, {
+    swaggerOptions: { persistAuthorization: true },
+  });
 }
 
 async function bootstrap() {
@@ -35,7 +40,9 @@ async function bootstrap() {
       transform: true,
       exceptionFactory: (errors) => {
         const first = errors[0];
-        const message = first?.constraints ? Object.values(first.constraints)[0] : 'Validation failed';
+        const message = first?.constraints
+          ? Object.values(first.constraints)[0]
+          : 'Validation failed';
         return new BadRequestException(message);
       },
     }),

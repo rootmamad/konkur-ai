@@ -1,26 +1,41 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Inject,
   Injectable,
   InternalServerErrorException,
   NotFoundException,
 } from '@nestjs/common';
-import { and, desc, eq, inArray, ne, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNull, ne, or, sql } from 'drizzle-orm';
 import { DB } from '../../db/db.module';
 import type { Db } from '../../db/db.module';
 import type { DbOrTx, Tx } from '../../db/types';
 import { isUniqueViolation } from '../../db/pg-errors';
-import { examInstance, examTemplate } from '../../db/schema/exam';
+import {
+  examInstance,
+  examTemplate,
+  examTemplateKind,
+} from '../../db/schema/exam';
 import { attempt } from '../../db/schema/attempt';
 import { response } from '../../db/schema/response';
 import { correction } from '../../db/schema/correction';
 import { question } from '../../db/schema/question';
 import { student } from '../../db/schema/student';
 import { answerKey } from '../../db/schema/answer-key';
+import { questionMastery } from '../../db/schema/question-mastery';
+import { subscription } from '../../db/schema/billing';
 import { QuestionType } from '../questions/enums/question-type.enum';
-import { StartExamDto } from './dto/start-exam.dto';
-import { ANSWER_SUBMIT_GRACE_SECONDS, MAX_QUESTIONS_PER_EXAM, MAX_TEXT_ANSWER_LENGTH } from './exam.constants';
+import { StartExamDto, CountsDto } from './dto/start-exam.dto';
+import {
+  ANSWER_SUBMIT_GRACE_SECONDS,
+  DIAGNOSTIC_DURATION_SECONDS,
+  DIAGNOSTIC_QUESTION_COUNT,
+  FINAL_SIM_DURATION_SECONDS,
+  KONKUR_SIM_DURATION_SECONDS,
+  MAX_QUESTIONS_PER_EXAM,
+  MAX_TEXT_ANSWER_LENGTH,
+} from './exam.constants';
 
 export interface ExamSession {
   attemptId: string;
@@ -32,8 +47,29 @@ export interface ExamSession {
   serverTime: Date;
 }
 
-type StoredAnswer = { selectedOption: number | null; textAnswer: string | null };
+type StoredAnswer = {
+  selectedOption: number | null;
+  textAnswer: string | null;
+};
 type ResponseRow = typeof response.$inferSelect;
+type ExamKind = (typeof examTemplateKind.enumValues)[number];
+type SelectDto = StartExamDto & {
+  counts: CountsDto;
+  durationSeconds: number;
+};
+
+const KIND_TITLES: Record<ExamKind, string> = {
+  quiz_after_study: 'Quiz After Study',
+  debug_errors: 'Debug Errors',
+  due_review: 'Due Review',
+  speed: 'Speed Quiz',
+  trap_finder: 'Trap Finder',
+  general_prep: 'General Prep',
+  smart_mix: 'Smart Mix',
+  diagnostic: 'Diagnostic',
+  konkur_sim: 'Konkur Simulation',
+  final_sim: 'Final Simulation',
+};
 
 /** Current difficulty buckets used for selection (see open decision on 1-5 scale). */
 const DIFFICULTY_BUCKETS = [
@@ -46,7 +82,18 @@ const DIFFICULTY_BUCKETS = [
 export class ExamsService {
   constructor(@Inject(DB) private readonly db: Db) {}
 
-  async startExam(userId: string, dto: StartExamDto, clientKey: string): Promise<ExamSession> {
+  async startExam(
+    userId: string,
+    dto: StartExamDto,
+    clientKey: string,
+  ): Promise<ExamSession> {
+    // 1) Subscription check for simulation kinds (before resolving student).
+    if (dto.kind === 'konkur_sim' || dto.kind === 'final_sim') {
+      if (!(await this.hasPaidPlan(userId))) {
+        throw new ForbiddenException('این آزمون نیازمند پلن پولی است');
+      }
+    }
+
     const studentId = await this.requireStudentId(userId);
     const idempotencyKey = `${studentId}:${clientKey}`;
 
@@ -54,14 +101,43 @@ export class ExamsService {
     const replay = await this.findSessionByKey(idempotencyKey);
     if (replay) return replay;
 
-    const total = dto.counts.easy + dto.counts.normal + dto.counts.hard;
-    if (total === 0) throw new BadRequestException('At least one question must be selected');
-    if (total > MAX_QUESTIONS_PER_EXAM) {
-      throw new BadRequestException(`At most ${MAX_QUESTIONS_PER_EXAM} questions per exam`);
+    let counts: StartExamDto['counts'];
+    let durationSeconds: number;
+
+    if (dto.kind === ('diagnostic' as ExamKind)) {
+      counts = { easy: 0, normal: 0, hard: 0 };
+      durationSeconds = DIAGNOSTIC_DURATION_SECONDS;
+    } else if (dto.kind === ('konkur_sim' as ExamKind)) {
+      counts = { easy: 0, normal: 0, hard: 0 };
+      durationSeconds = KONKUR_SIM_DURATION_SECONDS;
+    } else if (dto.kind === ('final_sim' as ExamKind)) {
+      counts = { easy: 0, normal: 0, hard: 0 };
+      durationSeconds = FINAL_SIM_DURATION_SECONDS;
+    } else {
+      if (!dto.counts || !dto.durationSeconds) {
+        throw new BadRequestException(
+          'counts and durationSeconds are required for this exam kind',
+        );
+      }
+      const total = dto.counts.easy + dto.counts.normal + dto.counts.hard;
+      if (total === 0) {
+        throw new BadRequestException('At least one question must be selected');
+      }
+      if (total > MAX_QUESTIONS_PER_EXAM) {
+        throw new BadRequestException(
+          `At most ${MAX_QUESTIONS_PER_EXAM} questions per exam`,
+        );
+      }
+      counts = dto.counts;
+      durationSeconds = dto.durationSeconds;
     }
 
-    const questionIds = await this.selectQuestionIds(dto);
-    if (questionIds.length === 0) throw new BadRequestException('No questions found matching criteria');
+    const questionIds = await this.selectQuestionIds(
+      { ...dto, counts: counts, durationSeconds },
+      studentId,
+    );
+    if (questionIds.length === 0)
+      throw new BadRequestException('No questions found matching criteria');
 
     try {
       return await this.db.transaction(async (tx) => {
@@ -72,9 +148,10 @@ export class ExamsService {
             templateId,
             questionOrder: questionIds,
             settingsSnapshot: {
+              kind: dto.kind,
               questionType: dto.questionType,
-              counts: dto.counts,
-              durationSeconds: dto.durationSeconds,
+              counts,
+              durationSeconds,
               generatedAt: new Date().toISOString(),
             },
           })
@@ -82,10 +159,20 @@ export class ExamsService {
 
         const [created] = await tx
           .insert(attempt)
-          .values({ studentId, examInstanceId: instance.id, status: 'in_progress', idempotencyKey })
+          .values({
+            studentId,
+            examInstanceId: instance.id,
+            status: 'in_progress',
+            idempotencyKey,
+          })
           .returning({ id: attempt.id, startedAt: attempt.startedAt });
 
-        return this.toSession(created.id, questionIds, dto.durationSeconds, created.startedAt);
+        return this.toSession(
+          created.id,
+          questionIds,
+          durationSeconds,
+          created.startedAt,
+        );
       });
     } catch (error) {
       // Two concurrent retries: the loser reads the winner's attempt.
@@ -97,7 +184,12 @@ export class ExamsService {
     }
   }
 
-  async submitAnswer(attemptId: string, userId: string, questionIndex: number, answer: unknown): Promise<void> {
+  async submitAnswer(
+    attemptId: string,
+    userId: string,
+    questionIndex: number,
+    answer: unknown,
+  ): Promise<void> {
     const studentId = await this.requireStudentId(userId);
     const ctx = await this.loadOwnedAttempt(this.db, attemptId, studentId);
     this.assertInProgress(ctx.status);
@@ -110,14 +202,19 @@ export class ExamsService {
     const questionId = order[questionIndex];
 
     const [q] = await this.db
-      .select({ version: question.version, type: question.type, options: question.options })
+      .select({
+        version: question.version,
+        type: question.type,
+        options: question.options,
+      })
       .from(question)
       .where(eq(question.id, questionId))
       .limit(1);
     if (!q) throw new NotFoundException('Question not found');
 
     const stored = this.normalizeAnswer(q.type, q.options, answer);
-    const attemptNumber = (await this.countPriorAttempts(studentId, questionId, attemptId)) + 1;
+    const attemptNumber =
+      (await this.countPriorAttempts(studentId, questionId, attemptId)) + 1;
 
     // Upsert keeps the save idempotent: a retried or changed answer
     // overwrites the same row instead of creating duplicates.
@@ -135,9 +232,39 @@ export class ExamsService {
         target: [response.attemptId, response.questionId],
         set: { ...stored, answeredAt: new Date() },
       });
+
+    if (
+      q.type === QuestionType.MULTIPLE_CHOICE ||
+      q.type === QuestionType.TRUE_FALSE
+    ) {
+      const [key] = await this.db
+        .select({ correctOptionIndex: answerKey.correctOptionIndex })
+        .from(answerKey)
+        .where(
+          and(
+            eq(answerKey.questionId, questionId),
+            eq(answerKey.questionVersion, q.version),
+          ),
+        )
+        .limit(1);
+
+      if (key?.correctOptionIndex != null && stored.selectedOption != null) {
+        const isCorrect = key.correctOptionIndex === stored.selectedOption;
+        await this.recordAnswerOutcome(
+          this.db,
+          studentId,
+          questionId,
+          isCorrect,
+          new Date(),
+        );
+      }
+    }
   }
 
-  async finishExam(attemptId: string, userId: string): Promise<{ totalScore: number; pendingDescriptive: number }> {
+  async finishExam(
+    attemptId: string,
+    userId: string,
+  ): Promise<{ totalScore: number; pendingDescriptive: number }> {
     const studentId = await this.requireStudentId(userId);
 
     return this.db.transaction(async (tx) => {
@@ -145,7 +272,10 @@ export class ExamsService {
       const ctx = await this.loadOwnedAttempt(tx, attemptId, studentId, true);
       this.assertInProgress(ctx.status);
 
-      const rows = await tx.select().from(response).where(eq(response.attemptId, attemptId));
+      const rows = await tx
+        .select()
+        .from(response)
+        .where(eq(response.attemptId, attemptId));
       const descriptive = rows.filter((r) => r.textAnswer !== null);
       const choice = rows.filter((r) => r.selectedOption !== null);
 
@@ -216,7 +346,31 @@ export class ExamsService {
     return row.id;
   }
 
-  private async loadOwnedAttempt(executor: DbOrTx, attemptId: string, studentId: string, lock = false) {
+  private async hasPaidPlan(userId: string): Promise<boolean> {
+    const [row] = await this.db
+      .select({ plan: subscription.plan })
+      .from(subscription)
+      .innerJoin(student, eq(student.id, subscription.studentId))
+      .where(
+        and(
+          eq(student.accountId, userId),
+          inArray(subscription.plan, ['full', 'advisor']),
+          or(
+            isNull(subscription.expiresAt),
+            sql`${subscription.expiresAt} > now()`,
+          ),
+        ),
+      )
+      .limit(1);
+    return !!row;
+  }
+
+  private async loadOwnedAttempt(
+    executor: DbOrTx,
+    attemptId: string,
+    studentId: string,
+    lock = false,
+  ) {
     const base = executor
       .select({
         id: attempt.id,
@@ -237,7 +391,9 @@ export class ExamsService {
     return rows[0];
   }
 
-  private async findSessionByKey(idempotencyKey: string): Promise<ExamSession | null> {
+  private async findSessionByKey(
+    idempotencyKey: string,
+  ): Promise<ExamSession | null> {
     const [row] = await this.db
       .select({
         id: attempt.id,
@@ -251,13 +407,60 @@ export class ExamsService {
       .limit(1);
 
     if (!row) return null;
-    return this.toSession(row.id, row.questionOrder as string[], this.durationOf(row.settings), row.startedAt);
+    return this.toSession(
+      row.id,
+      row.questionOrder as string[],
+      this.durationOf(row.settings),
+      row.startedAt,
+    );
   }
 
-  private async selectQuestionIds(dto: StartExamDto): Promise<string[]> {
+  private async selectQuestionIds(
+    dto: SelectDto,
+    studentId: string,
+  ): Promise<string[]> {
+    switch (dto.kind) {
+      case 'diagnostic':
+        return this.selectDiagnostic(studentId);
+      case 'konkur_sim':
+        // sourceYear is stored as the Persian (Solar Hijri / Shamsi) year,
+        // e.g. 1398 = کنکور ۱۳۹۸. If the DB is ever switched to Gregorian
+        // years, change the gte values below to 2019 (konkur) / 2023 (final).
+        return this.selectFromSource(studentId, {
+          mode: 'konkur',
+          sourceYear: { gte: 1398 },
+          limit: undefined,
+        });
+      case 'final_sim':
+        return this.selectFromSource(studentId, {
+          mode: 'final',
+          sourceYear: { gte: 1402 },
+          limit: undefined,
+        });
+      case 'trap_finder':
+        return this.selectTrapFinder(dto, studentId);
+      case 'debug_errors':
+        return this.selectDebugErrors(dto, studentId);
+      case 'due_review':
+        return this.selectDueReview(dto, studentId);
+      case 'speed':
+        return this.selectSpeed(dto, studentId);
+      case 'quiz_after_study':
+      case 'general_prep':
+      case 'smart_mix':
+      default:
+        return this.selectGeneralPrep(dto, studentId);
+    }
+  }
+
+  private async selectGeneralPrep(
+    dto: SelectDto,
+    studentId: string,
+  ): Promise<string[]> {
     const ids: string[] = [];
+    const counts = dto.counts;
     for (const { level, key } of DIFFICULTY_BUCKETS) {
-      const count = dto.counts[key];
+      const count = counts[key];
       if (count === 0) continue;
       const rows = await this.db
         .select({ id: question.id })
@@ -267,6 +470,12 @@ export class ExamsService {
             eq(question.status, 'published'),
             eq(question.type, dto.questionType),
             eq(question.difficultyAi, level),
+            sql`NOT EXISTS (
+              SELECT 1 FROM question_mastery qm
+              WHERE qm.student_id = ${studentId}
+                AND qm.question_id = ${question.id}
+                AND qm.mastered_at IS NOT NULL
+            )`,
           ),
         )
         .orderBy(sql`random()`)
@@ -276,51 +485,413 @@ export class ExamsService {
     return this.shuffle(ids);
   }
 
-  /** Placeholder until the 7 quiz kinds land (step 6). */
-  private async getOrCreateTemplateId(tx: Tx, dto: StartExamDto): Promise<string> {
+  private async selectTrapFinder(
+    dto: SelectDto,
+    studentId: string,
+  ): Promise<string[]> {
+    const counts = dto.counts;
+    const total = counts.easy + counts.normal + counts.hard;
+
+    const trapRows = await this.db
+      .select({ id: question.id })
+      .from(question)
+      .where(
+        and(
+          eq(question.status, 'published'),
+          eq(question.type, dto.questionType),
+          eq(question.hasTrap, true),
+          sql`NOT EXISTS (
+            SELECT 1 FROM question_mastery qm
+            WHERE qm.student_id = ${studentId}
+              AND qm.question_id = ${question.id}
+              AND qm.mastered_at IS NOT NULL
+          )`,
+        ),
+      )
+      .orderBy(sql`random()`)
+      .limit(total);
+
+    const ids = trapRows.map((r) => r.id);
+    if (ids.length >= total) return this.shuffle(ids);
+
+    const need = total - ids.length;
+    const fill = await this.db
+      .select({ id: question.id })
+      .from(question)
+      .where(
+        and(
+          eq(question.status, 'published'),
+          eq(question.type, dto.questionType),
+          eq(question.hasTrap, false),
+          sql`NOT EXISTS (
+            SELECT 1 FROM question_mastery qm
+            WHERE qm.student_id = ${studentId}
+              AND qm.question_id = ${question.id}
+              AND qm.mastered_at IS NOT NULL
+          )`,
+        ),
+      )
+      .orderBy(sql`random()`)
+      .limit(need);
+
+    return this.shuffle([...ids, ...fill.map((r) => r.id)]);
+  }
+
+  private async selectDebugErrors(
+    dto: SelectDto,
+    studentId: string,
+  ): Promise<string[]> {
+    const total = dto.counts.easy + dto.counts.normal + dto.counts.hard;
+
+    const wrongRows = await this.db
+      .selectDistinct({ id: question.id, topicId: question.topicId })
+      .from(question)
+      .innerJoin(response, eq(response.questionId, question.id))
+      .innerJoin(attempt, eq(attempt.id, response.attemptId))
+      .where(
+        and(
+          eq(attempt.studentId, studentId),
+          eq(response.isCorrect, false),
+          eq(question.status, 'published'),
+          eq(question.type, dto.questionType),
+          sql`NOT EXISTS (
+            SELECT 1 FROM question_mastery qm
+            WHERE qm.student_id = ${studentId}
+              AND qm.question_id = ${question.id}
+              AND qm.mastered_at IS NOT NULL
+          )`,
+        ),
+      )
+      .limit(total);
+
+    const ids = wrongRows.map((r) => r.id);
+    const topicsWithErrors = [
+      ...new Set(
+        wrongRows
+          .map((r) => r.topicId)
+          .filter((id): id is string => id != null),
+      ),
+    ];
+
+    if (ids.length >= total) return this.shuffle(ids);
+
+    const need = total - ids.length;
+    if (topicsWithErrors.length > 0) {
+      const freshRows = await this.db
+        .select({ id: question.id })
+        .from(question)
+        .where(
+          and(
+            eq(question.status, 'published'),
+            eq(question.type, dto.questionType),
+            inArray(question.topicId, topicsWithErrors),
+            sql`NOT EXISTS (
+              SELECT 1
+              FROM response r
+              JOIN attempt a ON a.id = r.attempt_id
+              WHERE a.student_id = ${studentId}
+                AND r.question_id = ${question.id}
+            )`,
+          ),
+        )
+        .orderBy(sql`random()`)
+        .limit(need);
+      ids.push(...freshRows.map((r) => r.id));
+    }
+
+    if (ids.length < total) {
+      const still = total - ids.length;
+      const fill = await this.selectGeneralPrep(
+        {
+          ...dto,
+          counts: { easy: still, normal: 0, hard: 0 },
+        },
+        studentId,
+      );
+      ids.push(...fill);
+    }
+
+    return this.shuffle(ids);
+  }
+
+  private async selectSpeed(
+    dto: SelectDto,
+    studentId: string,
+  ): Promise<string[]> {
+    const total = dto.counts.easy + dto.counts.normal + dto.counts.hard;
+    if (total === 0) return [];
+
+    const evidenceTopics = await this.db
+      .selectDistinct({ topicId: question.topicId })
+      .from(question)
+      .innerJoin(questionMastery, eq(questionMastery.questionId, question.id))
+      .where(
+        and(
+          eq(questionMastery.studentId, studentId),
+          sql`${questionMastery.masteredAt} IS NOT NULL OR ${questionMastery.currentStreak} >= 2`,
+          sql`${question.topicId} IS NOT NULL`,
+        ),
+      );
+
+    const topicIds = evidenceTopics
+      .map((r) => r.topicId)
+      .filter(Boolean) as string[];
+
+    if (topicIds.length === 0) {
+      return this.selectGeneralPrep(dto, studentId);
+    }
+
+    const rows = await this.db
+      .select({ id: question.id })
+      .from(question)
+      .where(
+        and(
+          eq(question.status, 'published'),
+          eq(question.type, dto.questionType),
+          inArray(question.topicId, topicIds),
+          sql`NOT EXISTS (
+            SELECT 1 FROM question_mastery qm
+            WHERE qm.student_id = ${studentId}
+              AND qm.question_id = ${question.id}
+              AND qm.mastered_at IS NOT NULL
+          )`,
+        ),
+      )
+      .orderBy(sql`random()`)
+      .limit(total);
+
+    return this.shuffle(rows.map((r) => r.id));
+  }
+
+  private async selectDueReview(
+    dto: SelectDto,
+    studentId: string,
+  ): Promise<string[]> {
+    const total = dto.counts.easy + dto.counts.normal + dto.counts.hard;
+
+    const rows = await this.db
+      .select({ id: question.id })
+      .from(question)
+      .innerJoin(questionMastery, eq(questionMastery.questionId, question.id))
+      .where(
+        and(
+          eq(questionMastery.studentId, studentId),
+          eq(question.status, 'published'),
+          eq(question.type, dto.questionType),
+          sql`${questionMastery.masteredAt} IS NULL`,
+          sql`${questionMastery.nextDueAt} IS NOT NULL`,
+          sql`${questionMastery.nextDueAt} <= now()`,
+        ),
+      )
+      .orderBy(sql`${questionMastery.nextDueAt} ASC`)
+      .limit(total);
+
+    const ids = rows.map((r) => r.id);
+    if (ids.length < total) {
+      const fill = await this.selectGeneralPrep(
+        {
+          ...dto,
+          counts: { easy: total - ids.length, normal: 0, hard: 0 },
+        },
+        studentId,
+      );
+      ids.push(...fill);
+    }
+
+    return this.shuffle(ids);
+  }
+
+  private async selectDiagnostic(studentId: string): Promise<string[]> {
+    const rows = await this.db
+      .select({ id: question.id })
+      .from(question)
+      .where(eq(question.status, 'published'))
+      .orderBy(sql`random()`)
+      .limit(DIAGNOSTIC_QUESTION_COUNT);
+    return rows.map((r) => r.id);
+  }
+
+  private async selectFromSource(
+    studentId: string,
+    opts: {
+      mode: 'konkur' | 'final';
+      sourceYear?: { gte: number };
+      limit?: number;
+    },
+  ): Promise<string[]> {
+    const conditions = [
+      eq(question.status, 'published'),
+      sql`${question.sourceYear} IS NOT NULL`,
+    ];
+    if (opts.sourceYear) {
+      conditions.push(sql`${question.sourceYear} >= ${opts.sourceYear.gte}`);
+    }
+    if (opts.mode === 'konkur') {
+      conditions.push(sql`${question.sourceSession} IS NOT NULL`);
+    } else {
+      conditions.push(sql`${question.sourceLesson} IS NOT NULL`);
+    }
+
+    const rows = await this.db
+      .select({ id: question.id })
+      .from(question)
+      .where(and(...conditions))
+      .orderBy(sql`random()`)
+      .limit(opts.limit ?? MAX_QUESTIONS_PER_EXAM);
+
+    return rows.map((r) => r.id);
+  }
+
+  private async getOrCreateTemplateId(
+    tx: Tx,
+    dto: StartExamDto,
+  ): Promise<string> {
     const [existing] = await tx
       .select({ id: examTemplate.id })
       .from(examTemplate)
-      .where(eq(examTemplate.kind, 'smart_mix'))
+      .where(eq(examTemplate.kind, dto.kind))
       .limit(1);
     if (existing) return existing.id;
 
     const [created] = await tx
       .insert(examTemplate)
       .values({
-        kind: 'smart_mix',
-        title: 'Smart Mix Exam',
-        config: { questionType: dto.questionType, counts: dto.counts },
+        kind: dto.kind,
+        title: KIND_TITLES[dto.kind],
+        config: {
+          questionType: dto.questionType,
+          counts: dto.counts,
+        },
         settingsVersion: 1,
       })
       .returning({ id: examTemplate.id });
     return created.id;
   }
 
-  private normalizeAnswer(type: string, options: unknown, answer: unknown): StoredAnswer {
+  private async recordAnswerOutcome(
+    executor: DbOrTx,
+    studentId: string,
+    questionId: string,
+    isCorrect: boolean,
+    answeredAt: Date,
+  ): Promise<void> {
+    const answeredAtIso = answeredAt.toISOString();
+
+    await executor
+      .insert(questionMastery)
+      .values({
+        studentId,
+        questionId,
+        currentStreak: isCorrect ? 1 : 0,
+        totalAttempts: 1,
+        totalCorrect: isCorrect ? 1 : 0,
+        lastIsCorrect: isCorrect,
+        lastAnsweredAt: answeredAt,
+        masteredAt: null,
+        nextDueAt: sql`
+          ${answeredAtIso}::timestamptz + interval '1 day'
+        `,
+      })
+      .onConflictDoUpdate({
+        target: [questionMastery.studentId, questionMastery.questionId],
+        set: {
+          currentStreak: sql`
+            CASE
+              WHEN ${isCorrect}
+                THEN ${questionMastery.currentStreak} + 1
+              ELSE 0
+            END
+          `,
+          totalAttempts: sql`
+            ${questionMastery.totalAttempts} + 1
+          `,
+          totalCorrect: sql`
+            ${questionMastery.totalCorrect} + ${isCorrect ? 1 : 0}
+          `,
+          lastIsCorrect: isCorrect,
+          lastAnsweredAt: answeredAt,
+          masteredAt: sql`
+            CASE
+              WHEN NOT ${isCorrect}
+                THEN NULL
+              WHEN ${questionMastery.currentStreak} + 1 >= 2
+                THEN COALESCE(
+                  ${questionMastery.masteredAt},
+                  ${answeredAtIso}::timestamptz
+                )
+              ELSE ${questionMastery.masteredAt}
+            END
+          `,
+          nextDueAt: sql`
+            CASE
+              WHEN NOT ${isCorrect}
+                THEN ${answeredAtIso}::timestamptz + interval '1 day'
+              WHEN ${questionMastery.currentStreak} + 1 >= 2
+                THEN LEAST(
+                  ${answeredAtIso}::timestamptz
+                    + (
+                      LEAST(
+                        ${questionMastery.currentStreak} + 2,
+                        30
+                      ) * interval '1 day'
+                    ),
+                  ${answeredAtIso}::timestamptz
+                    + interval '30 days'
+                )
+              ELSE ${answeredAtIso}::timestamptz + interval '1 day'
+            END
+          `,
+          updatedAt: new Date(),
+        },
+      });
+  }
+
+  private normalizeAnswer(
+    type: string,
+    options: unknown,
+    answer: unknown,
+  ): StoredAnswer {
     if (type === QuestionType.MULTIPLE_CHOICE) {
       const optionCount = Array.isArray(options) ? options.length : 0;
-      if (typeof answer !== 'number' || !Number.isInteger(answer) || answer < 0 || answer >= optionCount) {
-        throw new BadRequestException('Answer must be a valid option index for this question');
+      if (
+        typeof answer !== 'number' ||
+        !Number.isInteger(answer) ||
+        answer < 0 ||
+        answer >= optionCount
+      ) {
+        throw new BadRequestException(
+          'Answer must be a valid option index for this question',
+        );
       }
       return { selectedOption: answer, textAnswer: null };
     }
 
     if (type === QuestionType.DESCRIPTIVE) {
-      if (typeof answer !== 'string') throw new BadRequestException('Answer must be text for this question');
+      if (typeof answer !== 'string')
+        throw new BadRequestException('Answer must be text for this question');
       const text = answer.trim();
       if (text.length === 0 || text.length > MAX_TEXT_ANSWER_LENGTH) {
-        throw new BadRequestException(`Text answer must be 1-${MAX_TEXT_ANSWER_LENGTH} characters`);
+        throw new BadRequestException(
+          `Text answer must be 1-${MAX_TEXT_ANSWER_LENGTH} characters`,
+        );
       }
       return { selectedOption: null, textAnswer: text };
     }
 
-    throw new BadRequestException(`Answering "${type}" questions is not supported yet`);
+    throw new BadRequestException(
+      `Answering "${type}" questions is not supported yet`,
+    );
   }
 
-  private async countPriorAttempts(studentId: string, questionId: string, currentAttemptId: string): Promise<number> {
+  private async countPriorAttempts(
+    studentId: string,
+    questionId: string,
+    currentAttemptId: string,
+  ): Promise<number> {
     const [row] = await this.db
-      .select({ count: sql<number>`count(distinct ${response.attemptId})::int` })
+      .select({
+        count: sql<number>`count(distinct ${response.attemptId})::int`,
+      })
       .from(response)
       .innerJoin(attempt, eq(attempt.id, response.attemptId))
       .where(
@@ -333,7 +904,10 @@ export class ExamsService {
     return row?.count ?? 0;
   }
 
-  private async gradeChoiceResponses(tx: Tx, rows: ResponseRow[]): Promise<number> {
+  private async gradeChoiceResponses(
+    tx: Tx,
+    rows: ResponseRow[],
+  ): Promise<number> {
     if (rows.length === 0) return 0;
 
     const keys = await tx
@@ -343,13 +917,24 @@ export class ExamsService {
         correctOptionIndex: answerKey.correctOptionIndex,
       })
       .from(answerKey)
-      .where(inArray(answerKey.questionId, [...new Set(rows.map((r) => r.questionId))]));
+      .where(
+        inArray(answerKey.questionId, [
+          ...new Set(rows.map((r) => r.questionId)),
+        ]),
+      );
 
-    const correctByVersion = new Map(keys.map((k) => [`${k.questionId}:${k.questionVersion}`, k.correctOptionIndex]));
+    const correctByVersion = new Map(
+      keys.map((k) => [
+        `${k.questionId}:${k.questionVersion}`,
+        k.correctOptionIndex,
+      ]),
+    );
 
     let score = 0;
     for (const r of rows) {
-      const correct = correctByVersion.get(`${r.questionId}:${r.questionVersion}`);
+      const correct = correctByVersion.get(
+        `${r.questionId}:${r.questionVersion}`,
+      );
       // Missing key => unknown (null), never a silent "wrong".
       const isCorrect = correct == null ? null : correct === r.selectedOption;
       await tx.update(response).set({ isCorrect }).where(eq(response.id, r.id));
@@ -359,11 +944,17 @@ export class ExamsService {
   }
 
   /** Spec 6: descriptive answers are never string-matched; they wait for rubric grading. */
-  private async queueDescriptiveForReview(tx: Tx, rows: ResponseRow[]): Promise<void> {
+  private async queueDescriptiveForReview(
+    tx: Tx,
+    rows: ResponseRow[],
+  ): Promise<void> {
     if (rows.length === 0) return;
     const ids = rows.map((r) => r.id);
 
-    await tx.update(response).set({ isCorrect: null }).where(inArray(response.id, ids));
+    await tx
+      .update(response)
+      .set({ isCorrect: null })
+      .where(inArray(response.id, ids));
 
     const existing = await tx
       .select({ responseId: correction.responseId })
@@ -386,11 +977,14 @@ export class ExamsService {
   }
 
   private assertInProgress(status: string): void {
-    if (status !== 'in_progress') throw new ConflictException('Attempt is not in progress');
+    if (status !== 'in_progress')
+      throw new ConflictException('Attempt is not in progress');
   }
 
   private assertBeforeDeadline(startedAt: Date, settings: unknown): void {
-    const hardStop = this.deadlineOf(startedAt, settings).getTime() + ANSWER_SUBMIT_GRACE_SECONDS * 1000;
+    const hardStop =
+      this.deadlineOf(startedAt, settings).getTime() +
+      ANSWER_SUBMIT_GRACE_SECONDS * 1000;
     if (Date.now() > hardStop) throw new ConflictException('Exam time is over');
   }
 
@@ -399,14 +993,26 @@ export class ExamsService {
   }
 
   private durationOf(settings: unknown): number {
-    const duration = (settings as { durationSeconds?: unknown } | null)?.durationSeconds;
-    if (typeof duration !== 'number' || !Number.isInteger(duration) || duration <= 0) {
-      throw new InternalServerErrorException('Exam settings snapshot is invalid');
+    const duration = (settings as { durationSeconds?: unknown } | null)
+      ?.durationSeconds;
+    if (
+      typeof duration !== 'number' ||
+      !Number.isInteger(duration) ||
+      duration <= 0
+    ) {
+      throw new InternalServerErrorException(
+        'Exam settings snapshot is invalid',
+      );
     }
     return duration;
   }
 
-  private toSession(attemptId: string, questionOrder: string[], durationSeconds: number, startedAt: Date): ExamSession {
+  private toSession(
+    attemptId: string,
+    questionOrder: string[],
+    durationSeconds: number,
+    startedAt: Date,
+  ): ExamSession {
     return {
       attemptId,
       questionOrder,
@@ -417,7 +1023,7 @@ export class ExamsService {
     };
   }
 
-  private shuffle<T>(items: T[]): T[] {
+  private shuffle(items: string[]): string[] {
     const result = [...items];
     for (let i = result.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));

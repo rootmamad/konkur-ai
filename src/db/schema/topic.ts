@@ -1,9 +1,4 @@
-import {
-  pgTable,
-  text,
-  timestamp,
-  uuid,
-} from 'drizzle-orm/pg-core';
+import { pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core';
 
 /**
  * Topic tree for the question bank (spec sections 4, 12).

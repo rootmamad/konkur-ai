@@ -1,10 +1,4 @@
-import {
-  pgEnum,
-  pgTable,
-  text,
-  timestamp,
-  uuid,
-} from 'drizzle-orm/pg-core';
+import { pgEnum, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core';
 
 import { attempt } from './attempt';
 import { question } from './question';

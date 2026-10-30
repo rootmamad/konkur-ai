@@ -1,5 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsInt, Min,IsDefined } from 'class-validator';
+import { IsInt, Min, IsDefined } from 'class-validator';
 
 export class SubmitAnswerDto {
   @ApiProperty({ example: 0, minimum: 0 })

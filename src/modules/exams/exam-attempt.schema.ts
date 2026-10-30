@@ -4,4 +4,6 @@
  * See src/db/schema/. This file stays only to fail loudly if
  * anything still imports it.
  */
-throw new Error('exam-attempt.schema.ts was removed with the Mongoose migration');
+throw new Error(
+  'exam-attempt.schema.ts was removed with the Mongoose migration',
+);
