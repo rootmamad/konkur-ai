@@ -65,6 +65,7 @@ export class ExamsController {
       user.userId,
       body.questionIndex,
       body.answer,
+      body.activeSeconds,
     );
     return { message: 'Answer saved' };
   }

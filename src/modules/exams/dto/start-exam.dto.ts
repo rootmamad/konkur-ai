@@ -1,8 +1,10 @@
 import { ApiProperty } from '@nestjs/swagger';
 import {
+  IsArray,
   IsEnum,
   IsInt,
   IsOptional,
+  IsUUID,
   Max,
   Min,
   ValidateNested,
@@ -62,4 +64,36 @@ export class StartExamDto {
   @Max(MAX_EXAM_DURATION_SECONDS)
   @IsOptional()
   durationSeconds?: number;
+
+  /**
+   * Studied topic for `quiz_after_study` (spec §5: the quiz must cover the
+   * main concepts of the chosen topic). Required for that kind only; ignored
+   * by every other quiz kind.
+   */
+  @ApiProperty({
+    example: '3fa85f64-5717-4562-b3fc-2c963f66afa6',
+    description: 'Required for quiz_after_study; ignored by other kinds',
+    required: false,
+  })
+  @IsUUID()
+  @IsOptional()
+  topicId?: string;
+
+  /**
+   * Selected topics for `general_prep` (spec §5: balanced coverage of the
+   * chosen topics). Questions are split evenly across these topics per
+   * difficulty bucket; empty/omitted keeps the random-across-all-topics
+   * behaviour. Ignored by every other quiz kind.
+   */
+  @ApiProperty({
+    type: [String],
+    example: ['3fa85f64-5717-4562-b3fc-2c963f66afa6'],
+    description:
+      'Balanced-coverage topics for general_prep; ignored by other kinds',
+    required: false,
+  })
+  @IsArray()
+  @IsUUID('4', { each: true })
+  @IsOptional()
+  topicIds?: string[];
 }
