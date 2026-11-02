@@ -49,6 +49,15 @@ import {
   MAX_TEXT_ANSWER_LENGTH,
 } from './exam.constants';
 
+/**
+ * ترکیبی هوشمند — MVP default shares of the question budget handed to each
+ * history-driven pool. Quotas are targets, not guarantees: a short pool is
+ * topped up from general prep. Candidates for app_config later (spec §10).
+ */
+export const SMART_MIX_DUE_RATIO = 0.4;
+export const SMART_MIX_ERROR_RATIO = 0.3;
+export const SMART_MIX_TRAP_RATIO = 0.3;
+
 export interface ExamSession {
   attemptId: string;
   questionOrder: string[];
@@ -623,11 +632,99 @@ export class ExamsService {
         return this.selectSpeed(dto, studentId);
       case 'quiz_after_study':
         return this.selectAfterStudy(dto, studentId);
-      case 'general_prep':
       case 'smart_mix':
+        return this.selectSmartMix(dto, studentId);
+      case 'general_prep':
       default:
         return this.selectGeneralPrep(dto, studentId);
     }
+  }
+
+  /**
+   * ترکیبی هوشمند — spec §5: a mix of the other quiz kinds proportional to the
+   * student's history. For a newcomer (no mastery rows and no answers yet) the
+   * smart mix IS the diagnostic, so `dto.counts` is ignored on that path.
+   */
+  private async selectSmartMix(
+    dto: SelectDto,
+    studentId: string,
+  ): Promise<string[]> {
+    const total = dto.counts.easy + dto.counts.normal + dto.counts.hard;
+
+    // Two cheap existence probes — zero rows in both means "newcomer".
+    const [mastery] = await this.db
+      .select({ id: questionMastery.id })
+      .from(questionMastery)
+      .where(eq(questionMastery.studentId, studentId))
+      .limit(1);
+    if (!mastery) {
+      const [answer] = await this.db
+        .select({ id: response.id })
+        .from(response)
+        .innerJoin(attempt, eq(attempt.id, response.attemptId))
+        .where(eq(attempt.studentId, studentId))
+        .limit(1);
+      if (!answer) return this.selectDiagnostic(studentId);
+    }
+
+    // One ordered list keeps the pool priorities in a single place.
+    // TODO: future: AI-generated questions (origin='ai', status='published')
+    // become pool 0 targeting the student's weak concepts — the generation func
+    // is built separately.
+    const poolSteps: {
+      ratio: number;
+      select: (poolDto: SelectDto) => Promise<string[]>;
+    }[] = [
+      {
+        ratio: SMART_MIX_DUE_RATIO,
+        select: (poolDto) => this.selectDueReview(poolDto, studentId),
+      },
+      {
+        ratio: SMART_MIX_ERROR_RATIO,
+        select: (poolDto) => this.selectDebugErrors(poolDto, studentId),
+      },
+      {
+        ratio: SMART_MIX_TRAP_RATIO,
+        select: (poolDto) => this.selectTrapFinder(poolDto, studentId),
+      },
+    ];
+
+    const chosen = new Set<string>();
+    const ids: string[] = [];
+
+    for (const step of poolSteps) {
+      if (ids.length >= total) break;
+      const quota = Math.floor(step.ratio * total);
+      if (quota <= 0) continue;
+      const poolIds = await step.select({
+        ...dto,
+        counts: { easy: quota, normal: 0, hard: 0 },
+      });
+      for (const id of poolIds) {
+        if (chosen.has(id)) continue;
+        chosen.add(id);
+        ids.push(id);
+        if (ids.length >= total) break;
+      }
+    }
+
+    if (ids.length < total) {
+      const fill = await this.selectGeneralPrep(
+        {
+          ...dto,
+          counts: { easy: total - ids.length, normal: 0, hard: 0 },
+        },
+        studentId,
+      );
+      for (const id of fill) {
+        if (chosen.has(id)) continue;
+        chosen.add(id);
+        ids.push(id);
+        if (ids.length >= total) break;
+      }
+    }
+
+    return this.shuffle(ids.slice(0, total));
   }
 
   private async selectGeneralPrep(
@@ -870,7 +967,10 @@ export class ExamsService {
         },
         studentId,
       );
-      ids.push(...fill);
+      // The fill excludes only mastered questions, so it can re-offer ids from
+      // the wrong/fresh pools — never serve the same question twice (spec §5).
+      const chosen = new Set(ids);
+      ids.push(...fill.filter((id) => !chosen.has(id)));
     }
 
     return this.shuffle(ids);
@@ -1004,7 +1104,10 @@ export class ExamsService {
         },
         studentId,
       );
-      ids.push(...fill);
+      // The fill excludes only mastered questions, so it can re-offer due ids
+      // — never serve the same question twice (spec §5).
+      const chosen = new Set(ids);
+      ids.push(...fill.filter((id) => !chosen.has(id)));
     }
 
     return this.shuffle(ids);
