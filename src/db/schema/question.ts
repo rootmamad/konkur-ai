@@ -26,6 +26,8 @@ export const questionStatus = pgEnum('question_status', [
   'archived',
 ]);
 
+export const questionOrigin = pgEnum('question_origin', ['bank', 'ai']);
+
 /**
  * Versioned question row (spec sections 4, 12).
  * Identity/origin, content blocks (text + visual formula order kept
@@ -48,6 +50,7 @@ export const question = pgTable('question', {
   concepts: jsonb('concepts').notNull().default([]),
   prerequisites: jsonb('prerequisites').notNull().default([]),
   hasTrap: boolean('has_trap').notNull().default(false),
+  origin: questionOrigin('origin').notNull().default('bank'),
   difficultyAi: integer('difficulty_ai'),
   sourceYear: integer('source_year'),
   sourceSession: text('source_session'),

@@ -20,6 +20,7 @@ export const aiOperation = pgEnum('ai_operation', [
   'exam_analysis',
   'overall_analysis',
   'study_extract',
+  'question_draft',
 ]);
 
 export const aiJob = pgTable('ai_job', {
