@@ -5,7 +5,7 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 import { DB } from '../../db/db.module';
 import type { Db } from '../../db/db.module';
 import { answerKey } from '../../db/schema/answer-key';
@@ -28,6 +28,17 @@ export const DRAFT_PROMPT_VERSION = 'draft-v1';
 export const MUTATE_PROMPT_VERSION = 'mutate-v1';
 export const VERIFY_PROMPT_VERSION = 'verify-v1';
 export const DRAFT_MAX_BATCH = 20;
+
+// ---------------------------------------------------------------------------
+// AI top-up config (fire-and-forget, never blocks exam start)
+// ---------------------------------------------------------------------------
+
+/**
+ * Cooldown window (hours) after publishing an AI-generated question for a
+ * weak topic before we allow another top-up for that same topic.
+ * Candidate for app_config override later (spec §10).
+ */
+export const TOP_UP_COOLDOWN_HOURS = 2;
 
 // ---------------------------------------------------------------------------
 // Validated draft shape
@@ -492,9 +503,11 @@ Options:
   }
 
   /**
-   * Persist the batch: ONE db.transaction, per draft a question row
-   * (status per verification gate, origin 'ai') + answer_key + explanation
-   * (origin 'ai_generated').
+   * Persist the batch in two phases (Task 6): first the verification gate
+   * runs OUTSIDE any transaction (model calls must never hold a pooled
+   * connection), then ONE db.transaction contains only the inserts — per
+   * draft a question row (status per gate, origin 'ai') + answer_key +
+   * explanation (origin 'ai_generated'), all-or-nothing.
    */
   private async processDrafts(
     drafts: AiDraft[],
@@ -504,21 +517,32 @@ Options:
       conceptsOverride?: string[];
     },
   ): Promise<DrafterResult> {
+    // Phase 1 — verification gate OUTSIDE any transaction. Each verify is a
+    // model call (up to two 60s HTTP round-trips per draft); holding a pooled
+    // connection across them can exhaust the postgres pool under concurrent
+    // admin triggers. Verified state is collected first, inserts after.
+    const gated: { draft: AiDraft; isVerified: boolean }[] = [];
+    for (const draft of drafts) {
+      const verifiedIndex = await this.verifyDraft(draft);
+      const isVerified =
+        verifiedIndex !== null && verifiedIndex === draft.correctOptionIndex;
+
+      if (!isVerified) {
+        this.logger.warn(
+          `Key mismatch; deferring draft "${draft.text.slice(0, 80)}"`,
+        );
+      }
+
+      gated.push({ draft, isVerified });
+    }
+
+    // Phase 2 — inserts only: ONE transaction, all-or-nothing unchanged, and
+    // the only awaited calls inside are DB inserts (no model/HTTP I/O).
     let published = 0;
     let deferred = 0;
 
     await this.db.transaction(async (tx) => {
-      for (const draft of drafts) {
-        const verifiedIndex = await this.verifyDraft(draft);
-        const isVerified =
-          verifiedIndex !== null && verifiedIndex === draft.correctOptionIndex;
-
-        if (!isVerified) {
-          this.logger.warn(
-            `Key mismatch; deferring draft "${draft.text.slice(0, 80)}"`,
-          );
-        }
-
+      for (const { draft, isVerified } of gated) {
         const [inserted] = await tx
           .insert(question)
           .values({
@@ -558,6 +582,52 @@ Options:
     });
 
     return { created: drafts.length, published, deferred };
+  }
+
+  /**
+   * Fire-and-forget AI top-up when a smart_mix selection comes up short.
+   * Never blocks exam start; safe against unhandled-rejection crashes.
+   *
+   * - Fetches the student's weak-topic context.
+   * - Returns early if no weak topics (no model call).
+   * - Throttles via stateless check: if a PUBLISHED question with origin 'ai'
+   *   exists for any weak topic within the cooldown window, skip generation.
+   * - Otherwise delegates to generateDraftsForStudent (which re-fetches context
+   *   and runs the full verification gate).
+   */
+  async topUpForShortage(studentId: string): Promise<void> {
+    const ctx = await this.historyContext.buildForStudent(studentId);
+    if (ctx.weakTopics.length === 0) {
+      return;
+    }
+
+    const weakTopicIds = ctx.weakTopics
+      .map((w) => w.topicId)
+      .filter((id): id is string => id != null);
+    const cooldownCutoff = new Date(
+      Date.now() - TOP_UP_COOLDOWN_HOURS * 60 * 60 * 1000,
+    );
+
+    // Stateless throttle: one EXISTS query, limit 1.
+    const recent = await this.db
+      .select({ id: question.id })
+      .from(question)
+      .where(
+        and(
+          eq(question.status, 'published'),
+          eq(question.origin, 'ai'),
+          inArray(question.topicId, weakTopicIds),
+          sql`${question.createdAt} >= ${cooldownCutoff.toISOString()}`,
+        ),
+      )
+      .limit(1);
+
+    if (recent.length > 0) {
+      return;
+    }
+
+    // Fire the generation; it re-fetches context and applies the verification gate.
+    await this.generateDraftsForStudent(studentId);
   }
 }
 

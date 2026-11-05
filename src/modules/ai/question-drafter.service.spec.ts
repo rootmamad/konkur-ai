@@ -67,8 +67,13 @@ function makeWeakTopic(
  * Mock DB: `select().from().leftJoin()...where().limit()` resolves
  * `sourceRows` (mutate source load); `transaction(fn)` runs fn against a
  * capturing mockTx whose `.insert(t).values(v)` pushes { table, values }.
+ * Optional `eventLog` captures ordering: 'transaction' is pushed when the
+ * transaction callback is entered.
  */
-function makeDb(sourceRows: Record<string, unknown>[] = []) {
+function makeDb(
+  sourceRows: Record<string, unknown>[] = [],
+  eventLog?: string[],
+) {
   const inserted: { table: unknown; values: Record<string, unknown> }[] = [];
   const returning = jest.fn(() => Promise.resolve([{ id: GENERATED_ID }]));
 
@@ -91,7 +96,10 @@ function makeDb(sourceRows: Record<string, unknown>[] = []) {
   };
   const from = jest.fn(() => ring);
   const select = jest.fn(() => ({ from }));
-  const transaction = jest.fn((fn: (t: unknown) => Promise<unknown>) => fn(tx));
+  const transaction = jest.fn(async (fn: (t: unknown) => Promise<unknown>) => {
+    eventLog?.push('transaction');
+    return fn(tx);
+  });
 
   const db = { select, transaction } as unknown as Db;
   return { db, tx, inserted, log: { select, from, where, limit, transaction } };
@@ -121,11 +129,14 @@ function makeHistory(weakTopics: WeakTopicContext[]) {
  * Wire runJob to behave like the real one for the two prompt versions:
  * the draft call parses the supplied drafts JSON; the verify call parses
  * {"answer": verifyAnswer}.
+ * Optional `eventLog` captures ordering: 'verify' is pushed for each
+ * VERIFY_PROMPT_VERSION call.
  */
 function stubRunJob(
   runJob: jest.Mock,
   draftsJson: unknown,
   verifyAnswer: number,
+  eventLog?: string[],
 ) {
   runJob.mockImplementation(
     (input: { promptVersion: string; parse: (raw: string) => unknown }) => {
@@ -136,6 +147,7 @@ function stubRunJob(
         return Promise.resolve(input.parse(JSON.stringify(draftsJson)));
       }
       if (input.promptVersion === VERIFY_PROMPT_VERSION) {
+        eventLog?.push('verify');
         return Promise.resolve(
           input.parse(JSON.stringify({ answer: verifyAnswer })),
         );
@@ -270,6 +282,138 @@ describe('QuestionDrafterService', () => {
       );
       expect(inserted).toHaveLength(0);
       expect(log.transaction).not.toHaveBeenCalled();
+    });
+
+    it('e) ordering: all verify runJob calls happen BEFORE transaction opens', async () => {
+      const eventLog: string[] = [];
+      const { db, log } = makeDb([], eventLog);
+      const { ai, runJob } = makeAi();
+      const draft1 = makeDraft({ text: 'سوال اول برای تست ترتیب' });
+      const draft2 = makeDraft({ text: 'سوال دوم برای تست ترتیب' });
+      const { history } = makeHistory([makeWeakTopic()]);
+      // Both drafts verify successfully (verifyAnswer matches correctOptionIndex)
+      stubRunJob(runJob, [draft1, draft2], 0, eventLog);
+      const svc = makeService(db, ai, history);
+
+      const result = await svc.generateDraftsForStudent(STUDENT_ID, 5);
+
+      expect(result).toEqual({ created: 2, published: 2, deferred: 0 });
+      // Sequence must be: verify, verify, transaction
+      expect(eventLog).toEqual(['verify', 'verify', 'transaction']);
+      expect(log.transaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('f) mid-batch insert failure -> exception surfaces, nothing committed', async () => {
+      // Custom DB with a transaction that throws on the second insert
+      type InsertRecord = { table: unknown; values: Record<string, unknown> };
+      const inserted: InsertRecord[] = [];
+      const returning = jest.fn(() => Promise.resolve([{ id: GENERATED_ID }]));
+      let insertCallCount = 0;
+
+      const throwingTx = {
+        insert: jest.fn((table: unknown) => ({
+          values: jest.fn((vals: Record<string, unknown>) => {
+            inserted.push({ table, values: vals });
+            insertCallCount += 1;
+            if (insertCallCount === 2) {
+              throw new Error('mid-batch insert failure');
+            }
+            return { returning };
+          }),
+        })),
+      };
+
+      const transaction = jest.fn(
+        async (fn: (t: unknown) => Promise<unknown>) => fn(throwingTx),
+      );
+      const select = jest.fn(() => ({
+        from: jest.fn(() => ({
+          leftJoin: jest.fn(() => ({
+            where: jest.fn(() => ({
+              limit: jest.fn(() => Promise.resolve([])),
+            })),
+          })),
+        })),
+      }));
+      const db = { select, transaction } as unknown as Db;
+
+      const { ai, runJob } = makeAi();
+      const draft = makeDraft();
+      const { history } = makeHistory([makeWeakTopic()]);
+      stubRunJob(runJob, [draft], draft.correctOptionIndex);
+      const svc = makeService(db, ai, history);
+
+      await expect(svc.generateDraftsForStudent(STUDENT_ID, 5)).rejects.toThrow(
+        'mid-batch insert failure',
+      );
+      expect(transaction).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('topUpForShortage', () => {
+    it('a) no weak topics -> returns early, no model call', async () => {
+      const { db } = makeDb();
+      const { ai, runJob } = makeAi();
+      const { history } = makeHistory([]); // no weak topics
+      const svc = makeService(db, ai, history);
+
+      await svc.topUpForShortage(STUDENT_ID);
+
+      expect(runJob).not.toHaveBeenCalled();
+    });
+
+    it('b) fresh published origin-ai exists for weak topic -> generation NOT called', async () => {
+      const { db } = makeDb();
+      const { ai, runJob } = makeAi();
+      const { history } = makeHistory([makeWeakTopic()]);
+      const svc = makeService(db, ai, history);
+
+      // Mock the DB to return a recent published AI question for the weak topic
+      // The throttle check queries for published origin='ai' questions in weak topics
+      // We need to override the select chain for this specific query
+      const recentQuestion = { id: 'recent-ai-question' };
+      const recentSelect = jest.fn(() => ({
+        from: jest.fn(() => ({
+          where: jest.fn(() => ({
+            limit: jest.fn(() => Promise.resolve([recentQuestion])),
+          })),
+        })),
+      }));
+      // Replace the db.select with our mock for this test
+      (db as unknown as { select: jest.Mock }).select = recentSelect;
+
+      await svc.topUpForShortage(STUDENT_ID);
+
+      expect(runJob).not.toHaveBeenCalled();
+      expect(recentSelect).toHaveBeenCalled();
+    });
+
+    it('c) none fresh -> generateDraftsForStudent called once', async () => {
+      const { db } = makeDb();
+      const { ai, runJob } = makeAi();
+      const draft = makeDraft();
+      const { history } = makeHistory([makeWeakTopic()]);
+      stubRunJob(runJob, [draft], draft.correctOptionIndex);
+      const svc = makeService(db, ai, history);
+
+      // Mock the throttle check to return empty (no recent AI questions)
+      const emptySelect = jest.fn(() => ({
+        from: jest.fn(() => ({
+          where: jest.fn(() => ({
+            limit: jest.fn(() => Promise.resolve([])),
+          })),
+        })),
+      }));
+      (db as unknown as { select: jest.Mock }).select = emptySelect;
+
+      await svc.topUpForShortage(STUDENT_ID);
+
+      // generateDraftsForStudent should have been called (which calls runJob for draft + verify)
+      expect(runJob).toHaveBeenCalled();
+      // The first call should be for draft generation (DRAFT_PROMPT_VERSION)
+      expect(runJob).toHaveBeenCalledWith(
+        expect.objectContaining({ promptVersion: DRAFT_PROMPT_VERSION }),
+      );
     });
   });
 

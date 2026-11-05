@@ -5,7 +5,9 @@ import {
   Inject,
   Injectable,
   InternalServerErrorException,
+  Logger,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import {
   and,
@@ -38,6 +40,7 @@ import { quotaUsage, subscription } from '../../db/schema/billing';
 import { appConfig } from '../../db/schema/app-config';
 import { QuestionType } from '../questions/enums/question-type.enum';
 import { StartExamDto, CountsDto } from './dto/start-exam.dto';
+import type { QuestionDrafterService } from '../ai/question-drafter.service';
 import {
   ANSWER_SUBMIT_GRACE_SECONDS,
   DIAGNOSTIC_DURATION_SECONDS,
@@ -125,7 +128,11 @@ const SPEED_SECONDS_PER_QUESTION_DEFAULT = 60;
 
 @Injectable()
 export class ExamsService {
-  constructor(@Inject(DB) private readonly db: Db) {}
+  private readonly logger = new Logger(ExamsService.name);
+  constructor(
+    @Inject(DB) private readonly db: Db,
+    @Optional() private readonly drafter?: QuestionDrafterService,
+  ) {}
 
   async startExam(
     userId: string,
@@ -210,6 +217,21 @@ export class ExamsService {
     );
     if (questionIds.length === 0)
       throw new BadRequestException('No questions found matching criteria');
+
+    // Fire-and-forget AI top-up for smart_mix when selection falls short.
+    // Never awaited; .catch ensures no unhandled rejection can crash the process.
+    const totalRequested = counts.easy + counts.normal + counts.hard;
+    if (dto.kind === 'smart_mix' && questionIds.length < totalRequested) {
+      void this.drafter
+        ?.topUpForShortage(studentId)
+        ?.catch((err: unknown) =>
+          this.logger.warn(
+            `[${studentId}] AI top-up failed: ${String(
+              err instanceof Error ? err.message : err,
+            )}`,
+          ),
+        );
+    }
 
     try {
       return await this.db.transaction(async (tx) => {
@@ -312,9 +334,10 @@ export class ExamsService {
         set: { ...stored, activeSeconds, answeredAt: new Date() },
       });
 
+    const qType = q.type as QuestionType;
     if (
-      q.type === QuestionType.MULTIPLE_CHOICE ||
-      q.type === QuestionType.TRUE_FALSE
+      qType === QuestionType.MULTIPLE_CHOICE ||
+      qType === QuestionType.TRUE_FALSE
     ) {
       const [key] = await this.db
         .select({ correctOptionIndex: answerKey.correctOptionIndex })
@@ -1113,7 +1136,9 @@ export class ExamsService {
     return this.shuffle(ids);
   }
 
-  private async selectDiagnostic(studentId: string): Promise<string[]> {
+  // _studentId reserved for future filtering; diagnostic uses global pool
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  private async selectDiagnostic(_studentId: string): Promise<string[]> {
     const rows = await this.db
       .select({ id: question.id })
       .from(question)
@@ -1263,7 +1288,7 @@ export class ExamsService {
     options: unknown,
     answer: unknown,
   ): StoredAnswer {
-    if (type === QuestionType.MULTIPLE_CHOICE) {
+    if (type === String(QuestionType.MULTIPLE_CHOICE)) {
       const optionCount = Array.isArray(options) ? options.length : 0;
       if (
         typeof answer !== 'number' ||
@@ -1278,7 +1303,7 @@ export class ExamsService {
       return { selectedOption: answer, textAnswer: null };
     }
 
-    if (type === QuestionType.DESCRIPTIVE) {
+    if (type === String(QuestionType.DESCRIPTIVE)) {
       if (typeof answer !== 'string')
         throw new BadRequestException('Answer must be text for this question');
       const text = answer.trim();
