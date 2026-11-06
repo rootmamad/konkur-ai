@@ -30,7 +30,10 @@ function makeDto(overrides: Partial<DtoWithCounts> = {}): DtoWithCounts {
  */
 function waitFor(
   callback: () => void,
-  options: { timeout: number; interval: number } = { timeout: 1000, interval: 10 },
+  options: { timeout: number; interval: number } = {
+    timeout: 1000,
+    interval: 10,
+  },
 ): Promise<void> {
   const start = Date.now();
   return new Promise((resolve, reject) => {
@@ -40,14 +43,14 @@ function waitFor(
         resolve();
       } catch (e) {
         if (Date.now() - start > options.timeout) {
-          reject(e);
+          reject(e instanceof Error ? e : new Error(String(e)));
         } else {
           setTimeout(check, options.interval);
         }
-      };
+      }
     };
     check();
-  }
+  });
 }
 
 /**
@@ -174,6 +177,11 @@ type ExamsInternals = {
   hasPaidPlan: (userId: string) => Promise<boolean>;
   getFreeQuizLimit: () => Promise<number>;
   countQuizUsage: (studentId: string) => Promise<number>;
+  getWeakTopicIds: (studentId: string) => Promise<string[]>;
+  maybeMutateForPersistentShortage: (
+    studentId: string,
+    questionType: QuestionType,
+  ) => void;
   startExam: (
     userId: string,
     dto: StartExamDto,
@@ -385,7 +393,7 @@ describe('ExamsService AI top-up (fire-and-forget)', () => {
     // Part (i): No published origin-ai for weak topics -> mutation fires
     {
       const weakTopicIds = ['wt-1', 'wt-2'];
-      const { db: db1, transaction: transaction1 } = mockDbWithTransaction(['q-1', 'q-2'], weakTopicIds);
+      const { db: db1 } = mockDbWithTransaction(['q-1', 'q-2'], weakTopicIds);
 
       const drafter1 = makeDrafterMock();
       const internals1 = makeService(db1, drafter1);
@@ -396,13 +404,21 @@ describe('ExamsService AI top-up (fire-and-forget)', () => {
       // 2. anyPublishedAI check -> [] (empty, no published AI)
       // 3. bank questions for mutation -> ['bank-1', 'bank-2', 'bank-3', 'bank-4']
       let probeCall1 = 0;
-      const probeResults1 = [
-        ['wt-1', 'wt-2'], // 1. getWeakTopicIds
+      // Row shapes must match the select projections: getWeakTopicIds selects
+      // { topicId }, while the AI/bank probes select { id }.
+      const probeResults1: Array<Array<{ id?: string; topicId?: string }>> = [
+        [{ topicId: 'wt-1' }, { topicId: 'wt-2' }], // 1. getWeakTopicIds
         [], // 2. anyPublishedAI check - empty
-        ['bank-1', 'bank-2', 'bank-3', 'bank-4'], // 3. bank questions
+        [
+          { id: 'bank-1' },
+          { id: 'bank-2' },
+          { id: 'bank-3' },
+          { id: 'bank-4' },
+        ], // 3. bank questions
       ];
-      const limit1 = jest.fn(() =>
-        Promise.resolve((probeResults1[probeCall1++] ?? []).map((id) => ({ id }))),
+      // Emulate SQL LIMIT so the 3-question cap is applied by the query itself.
+      const limit1 = jest.fn((n?: number) =>
+        Promise.resolve((probeResults1[probeCall1++] ?? []).slice(0, n)),
       );
       const orderBy1 = jest.fn(() => ({ limit: limit1 }));
       const where1 = jest.fn(() => ({ limit: limit1, orderBy: orderBy1 }));
@@ -411,9 +427,11 @@ describe('ExamsService AI top-up (fire-and-forget)', () => {
       const select1 = jest.fn(() => ({ from: from1 }));
       (db1 as unknown as { select: jest.Mock }).select = select1;
 
-      // Call the private method directly
-      const maybeMutate = internals1.maybeMutateForPersistentShortage.bind(internals1);
-      maybeMutate(STUDENT_ID, QuestionType.MULTIPLE_CHOICE);
+      // Call the private method directly (bound to the mocked internals)
+      internals1.maybeMutateForPersistentShortage(
+        STUDENT_ID,
+        QuestionType.MULTIPLE_CHOICE,
+      );
 
       // Poll for mutation to be called (fire-and-forget async)
       await waitFor(() => expect(drafter1.mutateQuestion).toHaveBeenCalled(), {
@@ -431,7 +449,7 @@ describe('ExamsService AI top-up (fire-and-forget)', () => {
     // Part (ii): Published origin-ai exists -> mutation NOT called
     {
       const weakTopicIds2 = ['wt-1'];
-      const { db: db2, transaction: transaction2 } = mockDbWithTransaction(['q-1', 'q-2'], weakTopicIds2);
+      const { db: db2 } = mockDbWithTransaction(['q-1', 'q-2'], weakTopicIds2);
 
       const drafter2 = makeDrafterMock();
       const internals2 = makeService(db2, drafter2);
@@ -441,13 +459,13 @@ describe('ExamsService AI top-up (fire-and-forget)', () => {
       // 2. anyPublishedAI check -> ['ai-1'] (finds published AI)
       // 3. bank questions -> (not reached)
       let probeCall2 = 0;
-      const probeResults2 = [
-        ['wt-1'], // 1. getWeakTopicIds
-        ['ai-1'], // 2. anyPublishedAI check - finds published AI
-        ['bank-1', 'bank-2', 'bank-3'], // 3. bank questions (not reached)
+      const probeResults2: Array<Array<{ id?: string; topicId?: string }>> = [
+        [{ topicId: 'wt-1' }], // 1. getWeakTopicIds
+        [{ id: 'ai-1' }], // 2. anyPublishedAI check - finds published AI
+        [{ id: 'bank-1' }, { id: 'bank-2' }, { id: 'bank-3' }], // 3. bank questions (not reached)
       ];
-      const limit2 = jest.fn(() =>
-        Promise.resolve((probeResults2[probeCall2++] ?? []).map((id) => ({ id }))),
+      const limit2 = jest.fn((n?: number) =>
+        Promise.resolve((probeResults2[probeCall2++] ?? []).slice(0, n)),
       );
       const orderBy2 = jest.fn(() => ({ limit: limit2 }));
       const where2 = jest.fn(() => ({ limit: limit2, orderBy: orderBy2 }));
@@ -456,8 +474,10 @@ describe('ExamsService AI top-up (fire-and-forget)', () => {
       const select2 = jest.fn(() => ({ from: from2 }));
       (db2 as unknown as { select: jest.Mock }).select = select2;
 
-      const maybeMutate2 = internals2.maybeMutateForPersistentShortage.bind(internals2);
-      maybeMutate2(STUDENT_ID, QuestionType.MULTIPLE_CHOICE);
+      internals2.maybeMutateForPersistentShortage(
+        STUDENT_ID,
+        QuestionType.MULTIPLE_CHOICE,
+      );
 
       // Give time for the async function to complete and check anyPublishedAI
       await new Promise((r) => setTimeout(r, 50));
