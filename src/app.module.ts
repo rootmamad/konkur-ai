@@ -7,6 +7,8 @@ import { AuthModule } from './modules/auth/auth.module';
 import { QuestionsModule } from './modules/questions/questions.module';
 import { ExamsModule } from './modules/exams/exams.module';
 import { AIModule } from './modules/ai/ai.module';
+import { StudyModule } from './modules/study/study.module';
+import { DashboardModule } from './modules/dashboard/dashboard.module';
 import { DbModule } from './db/db.module';
 import { HealthModule } from './health/health.module';
 
@@ -24,6 +26,8 @@ import { HealthModule } from './health/health.module';
     QuestionsModule,
     AIModule,
     ExamsModule,
+    StudyModule,
+    DashboardModule,
   ],
 })
 export class AppModule {}
