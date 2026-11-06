@@ -1,4 +1,4 @@
-import type { Db, Tx } from '../../db/db.module';
+import type { Db } from '../../db/db.module';
 import { QuestionType } from '../questions/enums/question-type.enum';
 import type { CountsDto, StartExamDto } from './dto/start-exam.dto';
 import { ExamsService } from './exams.service';
@@ -26,6 +26,31 @@ function makeDto(overrides: Partial<DtoWithCounts> = {}): DtoWithCounts {
 }
 
 /**
+ * Helper to wait for an async condition (polling).
+ */
+function waitFor(
+  callback: () => void,
+  options: { timeout: number; interval: number } = { timeout: 1000, interval: 10 },
+): Promise<void> {
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const check = () => {
+      try {
+        callback();
+        resolve();
+      } catch (e) {
+        if (Date.now() - start > options.timeout) {
+          reject(e);
+        } else {
+          setTimeout(check, options.interval);
+        }
+      };
+    };
+    check();
+  }
+}
+
+/**
  * Mock DB for startExam with transaction support.
  */
 type MockTx = {
@@ -41,6 +66,7 @@ type MockDb = {
 
 function mockDbWithTransaction(
   selectQuestionIdsResult: string[] = ['q-1', 'q-2'],
+  weakTopicIds: string[] = ['wt-1'],
 ): {
   db: MockDb;
   tx: MockTx;
@@ -84,13 +110,21 @@ function mockDbWithTransaction(
     execute: jest.fn(() => Promise.resolve([])),
   };
 
-  const transaction = jest.fn(async (fn: (t: Tx) => Promise<unknown>) =>
+  const transaction = jest.fn(async (fn: (t: MockTx) => Promise<unknown>) =>
     fn(tx),
   );
 
-  // Mock select for the two newcomer probes (question_mastery, response)
+  // Mock select for:
+  // 1. Two newcomer probes (question_mastery, then response)
+  // 2. getWeakTopicIds (questionMastery innerJoin question)
+  // 3. selectAIGenPool (question with origin='ai' filter) - returns empty for top-up test
   let probeCall = 0;
-  const probeResults = [['m-1'], []]; // has mastery row, no responses
+  const probeResults = [
+    ['m-1'], // mastery probe
+    [], // response probe (empty)
+    weakTopicIds, // getWeakTopicIds
+    [], // selectAIGenPool - empty to trigger top-up
+  ];
   const limit = jest.fn(() =>
     Promise.resolve((probeResults[probeCall++] ?? []).map((id) => ({ id }))),
   );
@@ -343,5 +377,93 @@ describe('ExamsService AI top-up (fire-and-forget)', () => {
     ).resolves.toBeDefined();
     expect(transaction).toHaveBeenCalledTimes(1);
     // No drafter to call, so no error
+  });
+
+  // ---- Task 8 spec coverage ----
+
+  it('e) Mutation-fill heuristic: (i) no published origin-ai for weak topics -> drafter.mutateQuestion called (≥1 call), startExam returned normally; (ii) published origin-ai exists -> mutateQuestion NOT called; 3-question cap respected', async () => {
+    // Part (i): No published origin-ai for weak topics -> mutation fires
+    {
+      const weakTopicIds = ['wt-1', 'wt-2'];
+      const { db: db1, transaction: transaction1 } = mockDbWithTransaction(['q-1', 'q-2'], weakTopicIds);
+
+      const drafter1 = makeDrafterMock();
+      const internals1 = makeService(db1, drafter1);
+
+      // Override the select mock for the heuristic's internal queries
+      // Probe sequence for maybeMutateForPersistentShortage:
+      // 1. getWeakTopicIds -> ['wt-1', 'wt-2']
+      // 2. anyPublishedAI check -> [] (empty, no published AI)
+      // 3. bank questions for mutation -> ['bank-1', 'bank-2', 'bank-3', 'bank-4']
+      let probeCall1 = 0;
+      const probeResults1 = [
+        ['wt-1', 'wt-2'], // 1. getWeakTopicIds
+        [], // 2. anyPublishedAI check - empty
+        ['bank-1', 'bank-2', 'bank-3', 'bank-4'], // 3. bank questions
+      ];
+      const limit1 = jest.fn(() =>
+        Promise.resolve((probeResults1[probeCall1++] ?? []).map((id) => ({ id }))),
+      );
+      const orderBy1 = jest.fn(() => ({ limit: limit1 }));
+      const where1 = jest.fn(() => ({ limit: limit1, orderBy: orderBy1 }));
+      const innerJoin1 = jest.fn(() => ({ where: where1 }));
+      const from1 = jest.fn(() => ({ where: where1, innerJoin: innerJoin1 }));
+      const select1 = jest.fn(() => ({ from: from1 }));
+      (db1 as unknown as { select: jest.Mock }).select = select1;
+
+      // Call the private method directly
+      const maybeMutate = internals1.maybeMutateForPersistentShortage.bind(internals1);
+      maybeMutate(STUDENT_ID, QuestionType.MULTIPLE_CHOICE);
+
+      // Poll for mutation to be called (fire-and-forget async)
+      await waitFor(() => expect(drafter1.mutateQuestion).toHaveBeenCalled(), {
+        timeout: 1000,
+        interval: 10,
+      });
+
+      // mutateQuestion should be called at least once (up to 3 times)
+      expect(drafter1.mutateQuestion).toHaveBeenCalled();
+      const mutateCalls1 = drafter1.mutateQuestion.mock.calls.length;
+      expect(mutateCalls1).toBeGreaterThanOrEqual(1);
+      expect(mutateCalls1).toBeLessThanOrEqual(3); // 3-question cap
+    }
+
+    // Part (ii): Published origin-ai exists -> mutation NOT called
+    {
+      const weakTopicIds2 = ['wt-1'];
+      const { db: db2, transaction: transaction2 } = mockDbWithTransaction(['q-1', 'q-2'], weakTopicIds2);
+
+      const drafter2 = makeDrafterMock();
+      const internals2 = makeService(db2, drafter2);
+
+      // Probe sequence:
+      // 1. getWeakTopicIds -> ['wt-1']
+      // 2. anyPublishedAI check -> ['ai-1'] (finds published AI)
+      // 3. bank questions -> (not reached)
+      let probeCall2 = 0;
+      const probeResults2 = [
+        ['wt-1'], // 1. getWeakTopicIds
+        ['ai-1'], // 2. anyPublishedAI check - finds published AI
+        ['bank-1', 'bank-2', 'bank-3'], // 3. bank questions (not reached)
+      ];
+      const limit2 = jest.fn(() =>
+        Promise.resolve((probeResults2[probeCall2++] ?? []).map((id) => ({ id }))),
+      );
+      const orderBy2 = jest.fn(() => ({ limit: limit2 }));
+      const where2 = jest.fn(() => ({ limit: limit2, orderBy: orderBy2 }));
+      const innerJoin2 = jest.fn(() => ({ where: where2 }));
+      const from2 = jest.fn(() => ({ where: where2, innerJoin: innerJoin2 }));
+      const select2 = jest.fn(() => ({ from: from2 }));
+      (db2 as unknown as { select: jest.Mock }).select = select2;
+
+      const maybeMutate2 = internals2.maybeMutateForPersistentShortage.bind(internals2);
+      maybeMutate2(STUDENT_ID, QuestionType.MULTIPLE_CHOICE);
+
+      // Give time for the async function to complete and check anyPublishedAI
+      await new Promise((r) => setTimeout(r, 50));
+
+      // mutateQuestion should NOT be called because published AI exists
+      expect(drafter2.mutateQuestion).not.toHaveBeenCalled();
+    }
   });
 });

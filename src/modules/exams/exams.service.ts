@@ -14,6 +14,7 @@ import {
   desc,
   eq,
   inArray,
+  isNotNull,
   isNull,
   ne,
   notInArray,
@@ -101,6 +102,12 @@ const DIFFICULTY_BUCKETS = [
   { level: 2, key: 'normal' },
   { level: 3, key: 'hard' },
 ] as const;
+
+/**
+ * Maximum share of the total smart_mix quota that can be filled by the
+ * AI-generated pool (pool 0). Candidate for app_config override later.
+ */
+const AI_MAX_SHARE = 0.5;
 
 /**
  * Free-plan quiz quota (spec section 10). The authoritative numbers live in the
@@ -222,6 +229,7 @@ export class ExamsService {
     // Never awaited; .catch ensures no unhandled rejection can crash the process.
     const totalRequested = counts.easy + counts.normal + counts.hard;
     if (dto.kind === 'smart_mix' && questionIds.length < totalRequested) {
+      // 1. Normal top-up path (generates new AI questions if not throttled)
       void this.drafter
         ?.topUpForShortage(studentId)
         ?.catch((err: unknown) =>
@@ -231,6 +239,10 @@ export class ExamsService {
             )}`,
           ),
         );
+
+      // 2. Persistent-shortage mutation fallback: if no published AI questions
+      // exist for weak topics at all, mutate existing bank questions.
+      void this.maybeMutateForPersistentShortage(studentId, dto.questionType);
     }
 
     try {
@@ -667,6 +679,8 @@ export class ExamsService {
    * ترکیبی هوشمند — spec §5: a mix of the other quiz kinds proportional to the
    * student's history. For a newcomer (no mastery rows and no answers yet) the
    * smart mix IS the diagnostic, so `dto.counts` is ignored on that path.
+   * Pool 0 (aigen): published AI questions from the student's weak topics,
+   * up to AI_MAX_SHARE of the total quota.
    */
   private async selectSmartMix(
     dto: SelectDto,
@@ -690,14 +704,32 @@ export class ExamsService {
       if (!answer) return this.selectDiagnostic(studentId);
     }
 
+    // Build weak topic IDs using the same evidence the history builder uses:
+    // recent wrong answers (mastery + response probes already ran above).
+    // We reuse the history context's weak topics for the AI pool targeting.
+    const weakTopicIds = await this.getWeakTopicIds(studentId);
+
     // One ordered list keeps the pool priorities in a single place.
-    // TODO: future: AI-generated questions (origin='ai', status='published')
-    // become pool 0 targeting the student's weak concepts — the generation func
-    // is built separately.
+    // Pool 0 (aigen): published AI questions from weak topics, up to AI_MAX_SHARE.
     const poolSteps: {
       ratio: number;
       select: (poolDto: SelectDto) => Promise<string[]>;
-    }[] = [
+    }[] = [];
+
+    // Pool 0: AI-generated questions from weak topics (highest priority)
+    if (weakTopicIds.length > 0) {
+      const aiQuota = Math.floor(AI_MAX_SHARE * total);
+      if (aiQuota > 0) {
+        poolSteps.push({
+          ratio: 1, // handled specially with aiQuota
+          select: async (poolDto) =>
+            this.selectAIGenPool(poolDto, studentId, weakTopicIds, aiQuota),
+        });
+      }
+    }
+
+    // Existing pools: due review, debug errors, trap finder
+    poolSteps.push(
       {
         ratio: SMART_MIX_DUE_RATIO,
         select: (poolDto) => this.selectDueReview(poolDto, studentId),
@@ -710,14 +742,18 @@ export class ExamsService {
         ratio: SMART_MIX_TRAP_RATIO,
         select: (poolDto) => this.selectTrapFinder(poolDto, studentId),
       },
-    ];
+    );
 
     const chosen = new Set<string>();
     const ids: string[] = [];
 
     for (const step of poolSteps) {
       if (ids.length >= total) break;
-      const quota = Math.floor(step.ratio * total);
+      // For pool 0 (aigen), use the pre-calculated aiQuota; for others use ratio * total
+      const quota =
+        step.ratio === 1 && weakTopicIds.length > 0
+          ? Math.floor(AI_MAX_SHARE * total)
+          : Math.floor(step.ratio * total);
       if (quota <= 0) continue;
       const poolIds = await step.select({
         ...dto,
@@ -748,6 +784,159 @@ export class ExamsService {
     }
 
     return this.shuffle(ids.slice(0, total));
+  }
+
+  /**
+   * Get weak topic IDs for a student using the same evidence as the history builder.
+   * Returns topic IDs from recent wrong answers (mastery + response data).
+   * Avoids GROUP BY/DISTINCT for test mock compatibility — dedupes in JS.
+   */
+  private async getWeakTopicIds(studentId: string): Promise<string[]> {
+    // Get topic IDs from non-mastered questions the student has attempted
+    // We select all matching rows and deduplicate topicIds in JS.
+    const rows = await this.db
+      .select({ topicId: question.topicId })
+      .from(questionMastery)
+      .innerJoin(question, eq(question.id, questionMastery.questionId))
+      .where(
+        and(
+          eq(questionMastery.studentId, studentId),
+          isNull(questionMastery.masteredAt),
+          isNotNull(question.topicId),
+        ),
+      )
+      .limit(50); // Fetch more than needed, we'll dedupe and limit to 5
+
+    const seen = new Set<string>();
+    const topicIds: string[] = [];
+    for (const r of rows) {
+      if (r.topicId && !seen.has(r.topicId)) {
+        seen.add(r.topicId);
+        topicIds.push(r.topicId);
+        if (topicIds.length >= 5) break; // Same as MAX_WEAK_TOPICS
+      }
+    }
+    return topicIds;
+  }
+
+  /**
+   * Pool 0 (aigen): Select published AI-generated questions from weak topics.
+   * Excludes already mastered questions and deduplicates against already chosen IDs.
+   */
+  private async selectAIGenPool(
+    dto: SelectDto,
+    studentId: string,
+    weakTopicIds: string[],
+    quota: number,
+  ): Promise<string[]> {
+    const rows = await this.db
+      .select({ id: question.id })
+      .from(question)
+      .where(
+        and(
+          eq(question.status, 'published'),
+          eq(question.origin, 'ai'),
+          eq(question.type, dto.questionType),
+          inArray(question.topicId, weakTopicIds),
+          sql`NOT EXISTS (
+            SELECT 1 FROM question_mastery qm
+            WHERE qm.student_id = ${studentId}
+              AND qm.question_id = ${question.id}
+              AND qm.mastered_at IS NOT NULL
+          )`,
+        ),
+      )
+      .orderBy(sql`random()`)
+      .limit(quota);
+
+    return rows.map((r) => r.id);
+  }
+
+  /**
+   * Persistent-shortage mutation fallback (async, fire-and-forget).
+   * Triggered when smart_mix selection falls short AND no published AI questions
+   * exist for any weak topic (heuristic: throttle query returns empty for all time).
+   * Fires mutateQuestion on up to 3 existing bank questions from weak topics.
+   * Never blocks startExam; all errors caught and logged.
+   */
+  private maybeMutateForPersistentShortage(
+    studentId: string,
+    questionType: QuestionType,
+  ): void {
+    void (async () => {
+      try {
+        // Get weak topic IDs
+        const weakTopicIds = await this.getWeakTopicIds(studentId);
+        if (weakTopicIds.length === 0) return;
+
+        // Heuristic: check if ANY published origin='ai' questions exist for these weak topics.
+        // If yes, the throttle in topUpForShortage would have fired (or will fire), so skip mutation.
+        const anyPublishedAI = await this.db
+          .select({ id: question.id })
+          .from(question)
+          .where(
+            and(
+              eq(question.status, 'published'),
+              eq(question.origin, 'ai'),
+              inArray(question.topicId, weakTopicIds),
+            ),
+          )
+          .limit(1);
+
+        if (anyPublishedAI.length > 0) {
+          // Published AI questions exist — normal top-up path will handle it (or already did).
+          return;
+        }
+
+        // No published AI questions for weak topics: persistent shortage.
+        // Find up to 3 bank questions from weak topics to mutate.
+        const bankQuestions = await this.db
+          .select({ id: question.id })
+          .from(question)
+          .where(
+            and(
+              eq(question.status, 'published'),
+              eq(question.origin, 'bank'),
+              eq(question.type, questionType),
+              inArray(question.topicId, weakTopicIds),
+              sql`NOT EXISTS (
+                SELECT 1 FROM question_mastery qm
+                WHERE qm.student_id = ${studentId}
+                  AND qm.question_id = ${question.id}
+                  AND qm.mastered_at IS NOT NULL
+              )`,
+            ),
+          )
+          .orderBy(sql`random()`)
+          .limit(3);
+
+        if (bankQuestions.length === 0) return;
+
+        // Fire mutations in parallel (fire-and-forget)
+        // Wrap each in Promise.resolve to handle optional drafter and ensure we always pass Promises
+        await Promise.allSettled(
+          bankQuestions.map((q) =>
+            Promise.resolve(
+              this.drafter
+                ?.mutateQuestion(q.id)
+                .catch((err: unknown) =>
+                  this.logger.warn(
+                    `[${studentId}] Mutation failed for ${q.id}: ${String(
+                      err instanceof Error ? err.message : err,
+                    )}`,
+                  ),
+                ),
+            ),
+          ),
+        );
+      } catch (err: unknown) {
+        this.logger.warn(
+          `[${studentId}] Persistent-shortage mutation check failed: ${String(
+            err instanceof Error ? err.message : err,
+          )}`,
+        );
+      }
+    })();
   }
 
   private async selectGeneralPrep(

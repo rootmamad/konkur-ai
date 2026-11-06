@@ -21,20 +21,48 @@ function makeDto(overrides: Partial<DtoWithCounts> = {}): DtoWithCounts {
 }
 
 /**
- * The selector only touches the database for the two newcomer probes
- * (question_mastery, then response). Pool selectors are stubbed on the service,
- * so `probes` holds one result set per probe, in call order.
+ * The selector touches the database for:
+ * 1. Newcomer probes: mastery probe (always), response probe (only if no mastery)
+ * 2. getWeakTopicIds (questionMastery innerJoin question)
+ * Pool selectors are stubbed on the service.
  */
-function mockDb(probes: string[][] = []): {
+function mockDb(
+  probes: string[][] = [],
+  weakTopicProbe: string[] = ['wt-1'],
+): {
   db: Db;
   log: { select: jest.Mock; limits: number[] };
 } {
   const limits: number[] = [];
   let call = 0;
+  let masteryFound = false;
 
   const limit = jest.fn((count: number) => {
     limits.push(count);
-    return Promise.resolve((probes[call++] ?? []).map((id) => ({ id })));
+    // First call is always mastery probe
+    if (call === 0) {
+      const result = (probes[0] ?? []).map((id) => ({ id }));
+      masteryFound = result.length > 0;
+      call++;
+      return Promise.resolve(result);
+    }
+    // Second call: response probe ONLY if no mastery, otherwise getWeakTopicIds
+    if (call === 1) {
+      if (!masteryFound) {
+        // No mastery -> response probe
+        const result = (probes[1] ?? []).map((id) => ({ id }));
+        call++;
+        return Promise.resolve(result);
+      }
+      // Has mastery -> skip response, go straight to getWeakTopicIds
+      const result = weakTopicProbe.map((id) => ({ topicId: id }));
+      call++;
+      return Promise.resolve(result);
+    }
+    // Third call: getWeakTopicIds (only reached if no mastery)
+    const result = weakTopicProbe.map((id) => ({ topicId: id }));
+    call++;
+    return Promise.resolve(result);
   });
   const where = jest.fn(() => ({ limit }));
   const innerJoin = jest.fn(() => ({ where }));
@@ -51,6 +79,7 @@ type SmartMixInternals = {
   selectTrapFinder: jest.Mock;
   selectGeneralPrep: jest.Mock;
   selectDiagnostic: jest.Mock;
+  selectAIGenPool: jest.Mock;
 };
 
 function makeService(db: Db): SmartMixInternals {
@@ -61,6 +90,7 @@ function makeService(db: Db): SmartMixInternals {
   internals.selectTrapFinder = jest.fn().mockResolvedValue([]);
   internals.selectGeneralPrep = jest.fn().mockResolvedValue([]);
   internals.selectDiagnostic = jest.fn().mockResolvedValue([]);
+  internals.selectAIGenPool = jest.fn().mockResolvedValue([]);
   return internals;
 }
 
@@ -95,6 +125,7 @@ describe('ExamsService smart_mix selection', () => {
     expect(internals.selectGeneralPrep).not.toHaveBeenCalled();
 
     // Two cheap existence probes, each limited to a single row.
+    // (Newcomer path returns early, doesn't call getWeakTopicIds)
     expect(log.select).toHaveBeenCalledTimes(2);
     expect(log.limits).toEqual([1, 1]);
   });
@@ -105,7 +136,8 @@ describe('ExamsService smart_mix selection', () => {
 
     await internals.selectSmartMix(makeDto(), STUDENT_ID);
 
-    expect(log.select).toHaveBeenCalledTimes(1);
+    // Non-newcomer with mastery: 1 mastery probe (response probe skipped) + 1 getWeakTopicIds = 2 select calls
+    expect(log.select).toHaveBeenCalledTimes(2);
     expect(internals.selectDiagnostic).not.toHaveBeenCalled();
   });
 
@@ -221,5 +253,120 @@ describe('ExamsService smart_mix selection', () => {
       expect.objectContaining({ counts: { easy: 2, normal: 0, hard: 0 } }),
       STUDENT_ID,
     );
+  });
+
+  // ---- Task 8 spec coverage ----
+
+  it('a) AIGEN first + dedupe: weak topics present and selectAIGenPool returns ids -> both in final exactly once, called with AI_MAX_SHARE quota', async () => {
+    const { db } = mockDb([['m-1']]);
+    const internals = makeService(db);
+
+    internals.selectAIGenPool.mockResolvedValue(['ai-1', 'ai-2']);
+    internals.selectDueReview.mockResolvedValue(['ai-1', 'due-1']);
+    internals.selectDebugErrors.mockResolvedValue(['err-1']);
+    internals.selectTrapFinder.mockResolvedValue(['trap-1']);
+    internals.selectGeneralPrep.mockResolvedValue(['gp-1', 'gp-2']);
+
+    const dto = makeDto({ counts: { easy: 10, normal: 0, hard: 0 } });
+    const ids = await internals.selectSmartMix(dto, STUDENT_ID);
+
+    expect(internals.selectAIGenPool).toHaveBeenCalledWith(
+      expect.objectContaining({ counts: { easy: 5, normal: 0, hard: 0 } }),
+      STUDENT_ID,
+      ['wt-1'],
+      5,
+    );
+
+    expect(ids).toContain('ai-1');
+    expect(ids).toContain('ai-2');
+    expect(ids.filter((id) => id === 'ai-1')).toHaveLength(1);
+    expect(ids.filter((id) => id === 'ai-2')).toHaveLength(1);
+    expect(ids.length).toBeLessThanOrEqual(10);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it('b) AI pool empty -> behavior identical to pre-Task-8: selectAIGenPool returns [] -> no ids from it, existing pools drive selection', async () => {
+    const { db } = mockDb([['m-1']]);
+    const internals = makeService(db);
+
+    internals.selectAIGenPool.mockResolvedValue([]);
+    internals.selectDueReview.mockResolvedValue(['due-1', 'due-2']);
+    internals.selectDebugErrors.mockResolvedValue(['err-1']);
+    internals.selectTrapFinder.mockResolvedValue(['trap-1']);
+    internals.selectGeneralPrep.mockResolvedValue(['gp-1']);
+
+    const dto = makeDto({ counts: { easy: 5, normal: 0, hard: 0 } });
+    const ids = await internals.selectSmartMix(dto, STUDENT_ID);
+
+    expect(internals.selectAIGenPool).toHaveBeenCalled();
+    expect(ids).toEqual(
+      expect.arrayContaining(['due-1', 'due-2', 'err-1', 'trap-1', 'gp-1']),
+    );
+    expect(ids).not.toContain('ai-');
+    expect(ids.length).toBeLessThanOrEqual(5);
+  });
+
+  it('c) AI pool short (returns fewer than its quota) -> remainder comes from existing pools; final unique length == total', async () => {
+    const { db } = mockDb([['m-1']]);
+    const internals = makeService(db);
+
+    internals.selectAIGenPool.mockResolvedValue(['ai-1', 'ai-2']);
+    internals.selectDueReview.mockResolvedValue(['due-1', 'due-2', 'due-3']);
+    internals.selectDebugErrors.mockResolvedValue(['err-1']);
+    internals.selectTrapFinder.mockResolvedValue(['trap-1', 'trap-2']);
+    internals.selectGeneralPrep.mockResolvedValue(['gp-1', 'gp-2', 'gp-3']);
+
+    const dto = makeDto({ counts: { easy: 10, normal: 0, hard: 0 } });
+    const ids = await internals.selectSmartMix(dto, STUDENT_ID);
+
+    expect(ids).toContain('ai-1');
+    expect(ids).toContain('ai-2');
+    expect(ids.length).toBeLessThanOrEqual(10);
+    expect(new Set(ids).size).toBe(ids.length);
+
+    expect(internals.selectAIGenPool).toHaveBeenCalledWith(
+      expect.objectContaining({ counts: { easy: 5, normal: 0, hard: 0 } }),
+      STUDENT_ID,
+      ['wt-1'],
+      5,
+    );
+  });
+
+  it('d) AI_MAX_SHARE respected: total=10 -> selectAIGenPool requested with 5; remainder uses shared Set (no dupes)', async () => {
+    const { db } = mockDb([['m-1']]);
+    const internals = makeService(db);
+
+    internals.selectAIGenPool.mockResolvedValue([
+      'ai-1',
+      'ai-2',
+      'ai-3',
+      'ai-4',
+      'ai-5',
+    ]);
+    internals.selectDueReview.mockResolvedValue(['ai-3', 'due-1', 'due-2']);
+    internals.selectDebugErrors.mockResolvedValue(['err-1']);
+    internals.selectTrapFinder.mockResolvedValue(['trap-1']);
+    internals.selectGeneralPrep.mockResolvedValue([
+      'gp-1',
+      'gp-2',
+      'gp-3',
+      'gp-4',
+    ]);
+
+    const dto = makeDto({ counts: { easy: 10, normal: 0, hard: 0 } });
+    const ids = await internals.selectSmartMix(dto, STUDENT_ID);
+
+    expect(internals.selectAIGenPool).toHaveBeenCalledWith(
+      expect.objectContaining({ counts: { easy: 5, normal: 0, hard: 0 } }),
+      STUDENT_ID,
+      ['wt-1'],
+      5,
+    );
+
+    ['ai-1', 'ai-2', 'ai-3', 'ai-4', 'ai-5'].forEach((id) =>
+      expect(ids).toContain(id),
+    );
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids.length).toBeLessThanOrEqual(10);
   });
 });
