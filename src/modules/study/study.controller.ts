@@ -3,6 +3,9 @@ import {
   Body,
   Controller,
   Get,
+  HttpCode,
+  HttpStatus,
+  Logger,
   Post,
   Query,
   UseGuards,
@@ -21,7 +24,12 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import type { AuthenticatedUser } from '../../common/decorators/current-user.decorator';
 import { UserRole } from '../users/enums/user-role.enum';
 import { CreateStudyEntryDto } from './dto/create-study-entry.dto';
-import { MAX_RECENT_LIMIT, StudyService } from './study.service';
+import {
+  MAX_RECENT_LIMIT,
+  StudyService,
+  resolveWeekStart,
+} from './study.service';
+import { WeekSummaryService } from './week-summary.service';
 
 @ApiTags('study')
 @ApiBearerAuth('access-token')
@@ -29,7 +37,12 @@ import { MAX_RECENT_LIMIT, StudyService } from './study.service';
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Roles(UserRole.ADMIN, UserRole.STUDENT)
 export class StudyController {
-  constructor(private readonly studyService: StudyService) {}
+  private readonly logger = new Logger(StudyController.name);
+
+  constructor(
+    private readonly studyService: StudyService,
+    private readonly weekSummaryService: WeekSummaryService,
+  ) {}
 
   @Post('entries')
   @ApiOperation({ summary: 'Log a study entry from the short form' })
@@ -76,6 +89,47 @@ export class StudyController {
     @Query('weekStart') weekStart?: string,
   ) {
     return this.studyService.getWeekSummary(user.userId, weekStart);
+  }
+
+  @Post('summarize-week')
+  @HttpCode(HttpStatus.ACCEPTED)
+  @ApiOperation({
+    summary: "Queue the AI weekly summary and consume the week's entries",
+  })
+  @ApiQuery({
+    name: 'weekStart',
+    required: false,
+    description:
+      'ISO date of the week start; defaults to Monday of the current ISO week',
+  })
+  summarizeWeek(
+    @CurrentUser() user: AuthenticatedUser,
+    @Query('weekStart') weekStart?: string,
+  ) {
+    // Validate before queueing: a bad weekStart must be a 400 on the request,
+    // not just a logged failure inside the background job.
+    const start = resolveWeekStart(weekStart);
+
+    void this.weekSummaryService
+      .generateWeekSummary(user.userId, start)
+      .catch((error: unknown) => {
+        this.logger.warn(
+          `weekly summary failed for user ${user.userId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      });
+
+    return { queued: true };
+  }
+
+  @Get('summaries/latest')
+  @ApiOperation({ summary: 'Latest AI weekly summary from the coach thread' })
+  async getLatestWeekSummary(@CurrentUser() user: AuthenticatedUser) {
+    const latest = await this.weekSummaryService.getLatestWeekSummary(
+      user.userId,
+    );
+    return { summary: { at: latest.at, text: latest.summary } };
   }
 }
 

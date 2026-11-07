@@ -46,7 +46,7 @@ export interface WeekSummary {
  * the documented MVP choice and the Persian (Saturday-first) week is still an
  * open decision in the contract doc.
  */
-function currentIsoWeekStart(now: Date = new Date()): Date {
+export function currentIsoWeekStart(now: Date = new Date()): Date {
   const midnight = Date.UTC(
     now.getUTCFullYear(),
     now.getUTCMonth(),
@@ -64,12 +64,21 @@ function clampRecentLimit(limit?: number): number {
   return Math.min(Math.max(Math.trunc(limit), 1), MAX_RECENT_LIMIT);
 }
 
-function parseWeekStart(value: string): Date {
+export function parseWeekStart(value: string): Date {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) {
     throw new BadRequestException('weekStart must be an ISO date');
   }
   return parsed;
+}
+
+/**
+ * Resolve the week window start: an explicit ISO value verbatim, otherwise
+ * Monday 00:00 UTC of the current ISO week. Shared by the read card and the
+ * weekly-summary job so both always agree on the window.
+ */
+export function resolveWeekStart(value?: string): Date {
+  return value === undefined ? currentIsoWeekStart() : parseWeekStart(value);
 }
 
 /**
@@ -92,7 +101,7 @@ export class StudyService {
     userId: string,
     dto: CreateStudyEntryDto,
   ): Promise<StudyLog> {
-    const studentId = await this.requireStudentId(userId);
+    const studentId = await this.resolveStudentId(userId);
 
     const now = new Date();
     const doneAt = dto.doneAt === undefined ? now : new Date(dto.doneAt);
@@ -132,7 +141,7 @@ export class StudyService {
    * `feeling` is intentionally not copied: it describes yesterday's session.
    */
   async repeatYesterday(userId: string): Promise<StudyLog> {
-    const studentId = await this.requireStudentId(userId);
+    const studentId = await this.resolveStudentId(userId);
 
     const yesterdayStart = sql`date_trunc('day', now() - interval '1 day')`;
     const todayStart = sql`date_trunc('day', now())`;
@@ -185,12 +194,9 @@ export class StudyService {
     userId: string,
     weekStart?: string,
   ): Promise<WeekSummary> {
-    const studentId = await this.requireStudentId(userId);
+    const studentId = await this.resolveStudentId(userId);
 
-    const start =
-      weekStart === undefined
-        ? currentIsoWeekStart()
-        : parseWeekStart(weekStart);
+    const start = resolveWeekStart(weekStart);
     const end = new Date(start.getTime() + WEEK_MS);
 
     const rows = await this.db
@@ -236,7 +242,7 @@ export class StudyService {
 
   /** Latest entries for the student, newest first, `limit` clamped to 50. */
   async getRecent(userId: string, limit?: number): Promise<StudyLog[]> {
-    const studentId = await this.requireStudentId(userId);
+    const studentId = await this.resolveStudentId(userId);
 
     return this.db
       .select()
@@ -248,7 +254,13 @@ export class StudyService {
 
   // ---------- helpers ----------
 
-  private async requireStudentId(userId: string): Promise<string> {
+  /**
+   * Map the JWT account id to the student row id.
+   *
+   * Public so the weekly-summary job (and later study consumers) resolve the
+   * same student without duplicating the account -> student query.
+   */
+  async resolveStudentId(userId: string): Promise<string> {
     const [row] = await this.db
       .select({ id: student.id })
       .from(student)
