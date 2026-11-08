@@ -377,7 +377,9 @@ describe('AIService', () => {
 
       // The error-row insert also fails.
       insert.mockImplementation(() => ({
-        values: jest.fn(() => Promise.reject(new Error('db gone'))),
+        values: jest.fn<Promise<void>, [row: Record<string, unknown>]>(() =>
+          Promise.reject(new Error('db gone')),
+        ),
       }));
 
       const warnSpy = jest.spyOn(

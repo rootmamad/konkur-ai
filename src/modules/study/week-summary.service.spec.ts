@@ -87,8 +87,10 @@ function makeDb(options: MakeDbOptions = {}) {
   function selectChain() {
     const select = jest.fn(() => ({
       from: (table: unknown) => {
-        const source =
-          table === studyLog ? rows : table === chatThread ? threads : messages;
+        // Widened to Row[]: all three fixture kinds share this one chain mock.
+        const source = (
+          table === studyLog ? rows : table === chatThread ? threads : messages
+        ) as Row[];
 
         // Models the WHERE: the latest-summary query only sees assistant rows.
         const visible = (): Row[] =>
@@ -186,7 +188,7 @@ function makeDb(options: MakeDbOptions = {}) {
 /** Fake StudyService: only the account -> student lookup is used. */
 function makeStudy() {
   const resolveStudentId = jest
-    .fn<(userId: string) => Promise<string>>()
+    .fn<Promise<string>, [string]>()
     .mockResolvedValue(STUDENT_ID);
   return {
     service: { resolveStudentId } as unknown as StudyService,

@@ -28,13 +28,13 @@ function makeDto(overrides: Partial<DtoWithCounts> = {}): DtoWithCounts {
   };
 }
 
-type DebugErrorsStage = 'wrong' | 'fresh';
+type DebugErrorsStage = 'wrong' | 'fresh' | 'fill';
 
 type DebugErrorsQueryLog = {
   conditions: SQL[];
   distinctProjections: object[];
   limits: number[];
-  /** Query executions in order: one 'wrong'/'fresh' entry per DB query. */
+  /** Query executions in order; 'fill' is recorded by the general_prep test. */
   stages: DebugErrorsStage[];
   select: jest.Mock;
   selectDistinct: jest.Mock;

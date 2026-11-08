@@ -114,13 +114,13 @@ const TREND: TrendPoint[] = [
 
 function makeDashboard(summary: DashboardSummary = makeSummary()) {
   const resolveStudentId = jest
-    .fn<(userId: string) => Promise<string>>()
+    .fn<Promise<string>, [string]>()
     .mockResolvedValue(STUDENT_ID);
   const getSummary = jest
-    .fn<(userId: string) => Promise<DashboardSummary>>()
+    .fn<Promise<DashboardSummary>, [string]>()
     .mockResolvedValue(summary);
   const getTrend = jest
-    .fn<(userId: string, days?: number) => Promise<TrendPoint[]>>()
+    .fn<Promise<TrendPoint[]>, [string, number?]>()
     .mockResolvedValue(TREND);
 
   return {

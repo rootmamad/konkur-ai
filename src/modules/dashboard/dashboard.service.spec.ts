@@ -115,10 +115,10 @@ function makeStudyService(
     vagueCount: 0,
   };
   const getWeekSummary = jest
-    .fn<(userId: string, weekStart?: string) => Promise<WeekSummary>>()
+    .fn<Promise<WeekSummary>, [string, string?]>()
     .mockResolvedValue(summary);
   const getRecent = jest
-    .fn<(userId: string, limit?: number) => Promise<StudyLog[]>>()
+    .fn<Promise<StudyLog[]>, [string, number?]>()
     .mockResolvedValue(options.recent ?? []);
 
   return {
@@ -136,7 +136,7 @@ function makeHistoryContext(weakTopics: WeakTopicContext[] = []) {
     weakTopics,
   };
   const buildForStudent = jest
-    .fn<(studentId: string) => Promise<HistoryContext>>()
+    .fn<Promise<HistoryContext>, [string]>()
     .mockResolvedValue(context);
 
   return {

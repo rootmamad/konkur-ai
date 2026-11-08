@@ -4,7 +4,7 @@ import type { CountsDto, StartExamDto } from './dto/start-exam.dto';
 import { ExamsService } from './exams.service';
 import { QuestionDrafterService } from '../ai/question-drafter.service';
 
-/* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/unbound-method */
+/* eslint-disable @typescript-eslint/unbound-method */
 
 const STUDENT_ID = '0b6a2d3c-1e4f-4a5b-8c6d-7e8f9a0b1c2d';
 const USER_ID = 'user-1';
@@ -141,42 +141,31 @@ function mockDbWithTransaction(
   return { db, tx, transaction };
 }
 
+/** Pool selectors are jest mocks: callable by startExam and assertable here. */
+type PoolSelector = jest.Mock<Promise<string[]>, [DtoWithCounts, string]>;
+type StudentSelector = jest.Mock<Promise<string[]>, [string]>;
+
 type ExamsInternals = {
   selectQuestionIds: (
     dto: DtoWithCounts,
     studentId: string,
   ) => Promise<string[]>;
-  selectSmartMix: (dto: DtoWithCounts, studentId: string) => Promise<string[]>;
-  selectDueReview: (dto: DtoWithCounts, studentId: string) => Promise<string[]>;
-  selectDebugErrors: (
-    dto: DtoWithCounts,
-    studentId: string,
-  ) => Promise<string[]>;
-  selectTrapFinder: (
-    dto: DtoWithCounts,
-    studentId: string,
-  ) => Promise<string[]>;
-  selectGeneralPrep: (
-    dto: DtoWithCounts,
-    studentId: string,
-  ) => Promise<string[]>;
-  selectDiagnostic: (studentId: string) => Promise<string[]>;
-  selectKonkurSim: (studentId: string) => Promise<string[]>;
-  selectFinalSim: (studentId: string) => Promise<string[]>;
-  selectSpeed: (dto: DtoWithCounts, studentId: string) => Promise<string[]>;
-  selectAfterStudy: (
-    dto: DtoWithCounts,
-    studentId: string,
-  ) => Promise<string[]>;
-  selectQuizAfterStudy: (
-    dto: DtoWithCounts,
-    studentId: string,
-  ) => Promise<string[]>;
-  requireStudentId: (userId: string) => Promise<string>;
-  findSessionByKey: (key: string) => Promise<ExamSession | null>;
-  hasPaidPlan: (userId: string) => Promise<boolean>;
-  getFreeQuizLimit: () => Promise<number>;
-  countQuizUsage: (studentId: string) => Promise<number>;
+  selectSmartMix: PoolSelector;
+  selectDueReview: PoolSelector;
+  selectDebugErrors: PoolSelector;
+  selectTrapFinder: PoolSelector;
+  selectGeneralPrep: PoolSelector;
+  selectDiagnostic: StudentSelector;
+  selectKonkurSim: StudentSelector;
+  selectFinalSim: StudentSelector;
+  selectSpeed: PoolSelector;
+  selectAfterStudy: PoolSelector;
+  selectQuizAfterStudy: PoolSelector;
+  requireStudentId: jest.Mock<Promise<string>, [string]>;
+  findSessionByKey: jest.Mock<Promise<ExamSession | null>, [string]>;
+  hasPaidPlan: jest.Mock<Promise<boolean>, [string]>;
+  getFreeQuizLimit: jest.Mock<Promise<number>, []>;
+  countQuizUsage: jest.Mock<Promise<number>, [string]>;
   getWeakTopicIds: (studentId: string) => Promise<string[]>;
   maybeMutateForPersistentShortage: (
     studentId: string,
@@ -206,37 +195,37 @@ function makeService(
   const internals = service as unknown as ExamsInternals;
   // Mock pool selectors with proper function types
   internals.selectSmartMix = jest
-    .fn<(dto: DtoWithCounts, studentId: string) => Promise<string[]>>()
+    .fn<Promise<string[]>, [DtoWithCounts, string]>()
     .mockResolvedValue([]);
   internals.selectDueReview = jest
-    .fn<(dto: DtoWithCounts, studentId: string) => Promise<string[]>>()
+    .fn<Promise<string[]>, [DtoWithCounts, string]>()
     .mockResolvedValue([]);
   internals.selectDebugErrors = jest
-    .fn<(dto: DtoWithCounts, studentId: string) => Promise<string[]>>()
+    .fn<Promise<string[]>, [DtoWithCounts, string]>()
     .mockResolvedValue([]);
   internals.selectTrapFinder = jest
-    .fn<(dto: DtoWithCounts, studentId: string) => Promise<string[]>>()
+    .fn<Promise<string[]>, [DtoWithCounts, string]>()
     .mockResolvedValue([]);
   internals.selectGeneralPrep = jest
-    .fn<(dto: DtoWithCounts, studentId: string) => Promise<string[]>>()
+    .fn<Promise<string[]>, [DtoWithCounts, string]>()
     .mockResolvedValue([]);
   internals.selectDiagnostic = jest
-    .fn<(studentId: string) => Promise<string[]>>()
+    .fn<Promise<string[]>, [string]>()
     .mockResolvedValue([]);
   internals.selectKonkurSim = jest
-    .fn<(studentId: string) => Promise<string[]>>()
+    .fn<Promise<string[]>, [string]>()
     .mockResolvedValue([]);
   internals.selectFinalSim = jest
-    .fn<(studentId: string) => Promise<string[]>>()
+    .fn<Promise<string[]>, [string]>()
     .mockResolvedValue([]);
   internals.selectSpeed = jest
-    .fn<(dto: DtoWithCounts, studentId: string) => Promise<string[]>>()
+    .fn<Promise<string[]>, [DtoWithCounts, string]>()
     .mockResolvedValue([]);
   internals.selectAfterStudy = jest
-    .fn<(dto: DtoWithCounts, studentId: string) => Promise<string[]>>()
+    .fn<Promise<string[]>, [DtoWithCounts, string]>()
     .mockResolvedValue([]);
   internals.selectQuizAfterStudy = jest
-    .fn<(dto: DtoWithCounts, studentId: string) => Promise<string[]>>()
+    .fn<Promise<string[]>, [DtoWithCounts, string]>()
     .mockResolvedValue([]);
   // Bind startExam to the service instance so it's callable with proper `this`
   internals.startExam = service.startExam.bind(
@@ -244,19 +233,19 @@ function makeService(
   ) as ExamsInternals['startExam'];
   // Mock private methods used by startExam
   internals.requireStudentId = jest
-    .fn<(userId: string) => Promise<string>>()
+    .fn<Promise<string>, [string]>()
     .mockResolvedValue(STUDENT_ID);
   internals.findSessionByKey = jest
-    .fn<(key: string) => Promise<ExamSession | null>>()
+    .fn<Promise<ExamSession | null>, [string]>()
     .mockResolvedValue(null);
   internals.hasPaidPlan = jest
-    .fn<(userId: string) => Promise<boolean>>()
+    .fn<Promise<boolean>, [string]>()
     .mockResolvedValue(false);
   internals.getFreeQuizLimit = jest
-    .fn<() => Promise<number>>()
+    .fn<Promise<number>, []>()
     .mockResolvedValue(3);
   internals.countQuizUsage = jest
-    .fn<(studentId: string) => Promise<number>>()
+    .fn<Promise<number>, [string]>()
     .mockResolvedValue(0);
   return internals;
 }
