@@ -375,6 +375,54 @@ export class ExamsService {
     }
   }
 
+  /**
+   * Spec 8: the client keeps timing locally and periodically reports the
+   * cumulative elapsed seconds, so a closed page does not lose time. Same
+   * guards as submitAnswer, but only time is written: an answer already saved
+   * keeps its selectedOption/textAnswer/isCorrect/attemptNumber/answeredAt.
+   */
+  async syncQuestionTime(
+    attemptId: string,
+    userId: string,
+    questionIndex: number,
+    activeSeconds: number,
+  ): Promise<void> {
+    const studentId = await this.requireStudentId(userId);
+    const ctx = await this.loadOwnedAttempt(this.db, attemptId, studentId);
+    this.assertInProgress(ctx.status);
+    this.assertBeforeDeadline(ctx.startedAt, ctx.settings);
+
+    const order = ctx.questionOrder as string[];
+    if (questionIndex < 0 || questionIndex >= order.length) {
+      throw new BadRequestException('Invalid question index');
+    }
+    const questionId = order[questionIndex];
+
+    const [q] = await this.db
+      .select({ version: question.version })
+      .from(question)
+      .where(eq(question.id, questionId))
+      .limit(1);
+    if (!q) throw new NotFoundException('Question not found');
+
+    // Absolute value, not a delta (retry-safe). On conflict only the time
+    // column is touched, so a periodic ping can never clear or regrade an
+    // answer; a row created here is answer-less and contributes no score.
+    await this.db
+      .insert(response)
+      .values({
+        attemptId,
+        questionId,
+        questionVersion: q.version,
+        activeSeconds,
+        answeredAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: [response.attemptId, response.questionId],
+        set: { activeSeconds },
+      });
+  }
+
   async finishExam(
     attemptId: string,
     userId: string,
@@ -1525,6 +1573,12 @@ export class ExamsService {
           eq(attempt.studentId, studentId),
           eq(response.questionId, questionId),
           ne(response.attemptId, currentAttemptId),
+          // Spec 8 time-sync rows are not answers, so they must not inflate
+          // the spec 7 first-try attemptNumber of a later exam.
+          or(
+            isNotNull(response.selectedOption),
+            isNotNull(response.textAnswer),
+          ),
         ),
       );
     return row?.count ?? 0;

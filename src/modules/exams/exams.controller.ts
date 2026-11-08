@@ -26,6 +26,7 @@ import { UserRole } from '../users/enums/user-role.enum';
 import { ExamsService } from './exams.service';
 import { StartExamDto } from './dto/start-exam.dto';
 import { SubmitAnswerDto } from './dto/submit-answer.dto';
+import { SyncQuestionTimeDto } from './dto/sync-question-time.dto';
 
 @ApiTags('exams')
 @ApiBearerAuth('access-token')
@@ -68,6 +69,24 @@ export class ExamsController {
       body.activeSeconds,
     );
     return { message: 'Answer saved' };
+  }
+
+  @Post(':attemptId/time-sync')
+  @ApiOperation({
+    summary: 'Report cumulative time spent on one question (spec 8)',
+  })
+  async syncQuestionTime(
+    @Param('attemptId', ParseUUIDPipe) attemptId: string,
+    @CurrentUser() user: AuthenticatedUser,
+    @Body() body: SyncQuestionTimeDto,
+  ) {
+    await this.examsService.syncQuestionTime(
+      attemptId,
+      user.userId,
+      body.questionIndex,
+      body.activeSeconds,
+    );
+    return { message: 'Time synced' };
   }
 
   @Post(':attemptId/finish')
