@@ -3,6 +3,9 @@ import {
   Controller,
   Delete,
   Get,
+  HttpCode,
+  HttpStatus,
+  Logger,
   Param,
   ParseUUIDPipe,
   Patch,
@@ -10,7 +13,7 @@ import {
   Query,
   UseGuards,
 } from '@nestjs/common';
-import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
@@ -19,6 +22,8 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import type { AuthenticatedUser } from '../../common/decorators/current-user.decorator';
 import { UserRole } from '../users/enums/user-role.enum';
 import { QuestionAudience, QuestionsService } from './questions.service';
+import { ExplanationService } from './explanation.service';
+import type { ExplanationViewer } from './explanation.service';
 import { CreateQuestionDto, UpdateQuestionDto } from './dto/question.dto';
 import {
   QuestionListQueryDto,
@@ -29,12 +34,22 @@ import {
 const audienceOf = (user: AuthenticatedUser): QuestionAudience =>
   user.role === UserRole.ADMIN ? 'admin' : 'student';
 
+const viewerOf = (user: AuthenticatedUser): ExplanationViewer => ({
+  role: user.role,
+  userId: user.userId,
+});
+
 @ApiTags('questions')
 @ApiBearerAuth('access-token')
 @Controller('questions')
 @UseGuards(JwtAuthGuard, RolesGuard)
 export class QuestionsController {
-  constructor(private readonly questionsService: QuestionsService) {}
+  private readonly logger = new Logger(QuestionsController.name);
+
+  constructor(
+    private readonly questionsService: QuestionsService,
+    private readonly explanationService: ExplanationService,
+  ) {}
 
   @Get()
   @Roles(UserRole.ADMIN, UserRole.STUDENT)
@@ -61,6 +76,58 @@ export class QuestionsController {
     @CurrentUser() user: AuthenticatedUser,
   ) {
     return this.questionsService.getQuestionById(id, audienceOf(user));
+  }
+
+  @Get(':id/explanation')
+  @Roles(UserRole.ADMIN, UserRole.STUDENT)
+  @ApiOperation({
+    summary: 'Read the best explanation for a question',
+    description:
+      'Origins are never merged: official > source_book > ai_generated for the current question version. ' +
+      'Spec 13.2: an explanation reveals the answer, so a STUDENT is served one only after a response row ' +
+      'exists for this question (i.e. after submitAnswer) and gets 403 before that; ADMIN always reads it.',
+  })
+  async getExplanation(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    const explanation = await this.explanationService.getExplanation(
+      id,
+      viewerOf(user),
+    );
+    return {
+      explanation: { origin: explanation.origin, body: explanation.body },
+    };
+  }
+
+  @Post(':id/explanation/generate')
+  @HttpCode(HttpStatus.ACCEPTED)
+  @Roles(UserRole.ADMIN, UserRole.STUDENT)
+  @ApiOperation({
+    summary: 'Queue the one-time AI explanation for a question (cached)',
+    description:
+      'No-op when an official/source_book note exists or an ai_generated row is already cached for this ' +
+      'question version. Same Spec 13.2 gate as reading: a STUDENT can only warm the cache after answering.',
+  })
+  async generateExplanation(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    const viewer = viewerOf(user);
+    // Validate before queueing: the §13.2 gate must answer the request itself.
+    await this.explanationService.assertCanView(id, viewer);
+
+    void this.explanationService
+      .generateExplanation(id, viewer)
+      .catch((error: unknown) => {
+        this.logger.warn(
+          `explanation generation failed for question ${id}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      });
+
+    return { queued: true };
   }
 
   @Post()

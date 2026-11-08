@@ -246,10 +246,7 @@ export class QuestionsService {
         `Cannot move question from "${existing.status}" to "${next}"`,
       );
     }
-    if (
-      next === 'published' &&
-      existing.type === QuestionType.MULTIPLE_CHOICE
-    ) {
+    if (next === 'published' && existing.type === 'multiple_choice') {
       const [key] = await this.db
         .select({ correctOptionIndex: answerKey.correctOptionIndex })
         .from(answerKey)
