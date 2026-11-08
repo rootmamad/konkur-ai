@@ -246,7 +246,12 @@ export class QuestionsService {
         `Cannot move question from "${existing.status}" to "${next}"`,
       );
     }
-    if (next === 'published' && existing.type === 'multiple_choice') {
+    // requireQuestion returns a DB row (the pgEnum string union), so compare
+    // it in QuestionType terms: a renamed enum member then fails to compile.
+    if (
+      next === 'published' &&
+      (existing.type as QuestionType) === QuestionType.MULTIPLE_CHOICE
+    ) {
       const [key] = await this.db
         .select({ correctOptionIndex: answerKey.correctOptionIndex })
         .from(answerKey)
