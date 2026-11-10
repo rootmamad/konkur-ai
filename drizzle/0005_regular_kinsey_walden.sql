@@ -1,0 +1,1 @@
+ALTER TABLE "student" ADD COLUMN "studied_topic_ids" text[] DEFAULT '{}' NOT NULL;

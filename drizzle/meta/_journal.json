@@ -36,6 +36,13 @@
       "when": 1793783511527,
       "tag": "0004_tough_ultimo",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1794181212364,
+      "tag": "0005_regular_kinsey_walden",
+      "breakpoints": true
     }
   ]
 }

@@ -1,4 +1,9 @@
-import { ConflictException, Inject, Injectable } from '@nestjs/common';
+import {
+  ConflictException,
+  Inject,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { and, eq, or } from 'drizzle-orm';
 import { randomInt } from 'crypto';
 
@@ -21,6 +26,7 @@ export interface UserWithProfile {
   xp: number;
   level: number;
   streak: number;
+  studiedTopicIds: string[];
   createdAt: Date;
   updatedAt: Date;
 }
@@ -43,6 +49,7 @@ const profileColumns = {
   xp: student.xp,
   level: student.level,
   streak: student.streak,
+  studiedTopicIds: student.studiedTopicIds,
 };
 
 type ProfileRow = {
@@ -57,6 +64,7 @@ type ProfileRow = {
   xp: number | null;
   level: number | null;
   streak: number | null;
+  studiedTopicIds: string[] | null;
 };
 
 @Injectable()
@@ -84,6 +92,26 @@ export class UsersService {
       )
       .limit(1);
     return rows[0] ? this.toUser(rows[0]) : null;
+  }
+
+  /**
+   * Persist the self-reported studied-topic list (spec 3.2 onboarding).
+   * Updates ONLY that column on the existing student row and returns the
+   * new list; throws NotFoundException when the student row is missing
+   * (no row is ever created here — registration owns student creation).
+   */
+  async updateStudiedTopics(
+    userId: string,
+    topicIds: string[],
+  ): Promise<string[]> {
+    const rows = await this.db
+      .update(student)
+      .set({ studiedTopicIds: topicIds })
+      .where(eq(student.accountId, userId))
+      .returning({ studiedTopicIds: student.studiedTopicIds });
+    const [row] = rows;
+    if (!row) throw new NotFoundException('Student profile not found');
+    return row.studiedTopicIds;
   }
 
   async create(data: {
@@ -182,6 +210,7 @@ export class UsersService {
       xp: row.xp ?? 0,
       level: row.level ?? 1,
       streak: row.streak ?? 0,
+      studiedTopicIds: row.studiedTopicIds ?? [],
       createdAt: row.accountCreatedAt,
       updatedAt: row.accountUpdatedAt,
     };

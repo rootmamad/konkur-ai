@@ -21,6 +21,7 @@ import {
   or,
   sql,
 } from 'drizzle-orm';
+import type { SQL } from 'drizzle-orm';
 import { DB } from '../../db/db.module';
 import type { Db } from '../../db/db.module';
 import type { DbOrTx, Tx } from '../../db/types';
@@ -51,6 +52,10 @@ import {
   MAX_EXAM_DURATION_SECONDS,
   MAX_QUESTIONS_PER_EXAM,
   MAX_TEXT_ANSWER_LENGTH,
+  SIM_QUESTION_COUNT_DEFAULT,
+  SIM_QUESTION_COUNT_KEY,
+  SIM_SOURCE_MIN_YEAR,
+  SIM_TOPIC_CAP,
 } from './exam.constants';
 
 /**
@@ -102,6 +107,12 @@ const DIFFICULTY_BUCKETS = [
   { level: 2, key: 'normal' },
   { level: 3, key: 'hard' },
 ] as const;
+
+/**
+ * Spec §3.3: the diagnostic measures the basics, so it draws level-1
+ * questions only.
+ */
+const DIAGNOSTIC_DIFFICULTY_LEVEL = 1;
 
 /**
  * Maximum share of the total smart_mix quota that can be filled by the
@@ -691,20 +702,11 @@ export class ExamsService {
       case 'diagnostic':
         return this.selectDiagnostic(studentId);
       case 'konkur_sim':
-        // sourceYear is stored as the Persian (Solar Hijri / Shamsi) year,
-        // e.g. 1398 = کنکور ۱۳۹۸. If the DB is ever switched to Gregorian
-        // years, change the gte values below to 2019 (konkur) / 2023 (final).
-        return this.selectFromSource(studentId, {
-          mode: 'konkur',
-          sourceYear: { gte: 1398 },
-          limit: undefined,
-        });
+        // Real-exam simulation (spec 3.5): unseen past-exam questions,
+        // spread across topics and weighted towards weak ones.
+        return this.selectComprehensive(studentId, 'konkur');
       case 'final_sim':
-        return this.selectFromSource(studentId, {
-          mode: 'final',
-          sourceYear: { gte: 1402 },
-          limit: undefined,
-        });
+        return this.selectComprehensive(studentId, 'final');
       case 'trap_finder':
         return this.selectTrapFinder(dto, studentId);
       case 'debug_errors':
@@ -1373,47 +1375,287 @@ export class ExamsService {
     return this.shuffle(ids);
   }
 
-  // _studentId reserved for future filtering; diagnostic uses global pool
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  private async selectDiagnostic(_studentId: string): Promise<string[]> {
+  /**
+   * Initial diagnostic (spec §3.3): ten basic questions drawn from the topics
+   * the student reported studying in onboarding (§3.2), split evenly between
+   * multiple choice and short written answers (descriptive) so both recall
+   * modes are measured. Each half stays partial when its pool is short: a thin
+   * topic must not block the start, and the caller only rejects a fully empty
+   * selection. A newcomer with no studied topics keeps the old global random
+   * pool (no type split, no topic filter).
+   */
+  private async selectDiagnostic(studentId: string): Promise<string[]> {
+    const [row] = await this.db
+      .select({ studiedTopicIds: student.studiedTopicIds })
+      .from(student)
+      .where(eq(student.id, studentId))
+      .limit(1);
+    const studiedTopicIds = row?.studiedTopicIds ?? [];
+
+    if (studiedTopicIds.length === 0) {
+      const rows = await this.db
+        .select({ id: question.id })
+        .from(question)
+        .where(eq(question.status, 'published'))
+        .orderBy(sql`random()`)
+        .limit(DIAGNOSTIC_QUESTION_COUNT);
+      return rows.map((r) => r.id);
+    }
+
+    const choiceCount = Math.ceil(DIAGNOSTIC_QUESTION_COUNT / 2);
+    const choice = await this.selectDiagnosticPool(
+      studiedTopicIds,
+      QuestionType.MULTIPLE_CHOICE,
+      choiceCount,
+    );
+    const descriptive = await this.selectDiagnosticPool(
+      studiedTopicIds,
+      QuestionType.DESCRIPTIVE,
+      DIAGNOSTIC_QUESTION_COUNT - choiceCount,
+    );
+
+    // Interleave the halves: never five choices followed by five short ones.
+    return this.shuffle([...choice, ...descriptive]);
+  }
+
+  /**
+   * One half of the diagnostic: published basic (level 1) questions of a
+   * single type from the studied topics, random order, partial when short.
+   */
+  private async selectDiagnosticPool(
+    topicIds: string[],
+    type: QuestionType,
+    limit: number,
+  ): Promise<string[]> {
+    if (limit <= 0) return [];
     const rows = await this.db
       .select({ id: question.id })
       .from(question)
-      .where(eq(question.status, 'published'))
+      .where(
+        and(
+          eq(question.status, 'published'),
+          eq(question.type, type),
+          eq(question.difficultyAi, DIAGNOSTIC_DIFFICULTY_LEVEL),
+          inArray(question.topicId, topicIds),
+        ),
+      )
       .orderBy(sql`random()`)
-      .limit(DIAGNOSTIC_QUESTION_COUNT);
+      .limit(limit);
     return rows.map((r) => r.id);
   }
 
-  private async selectFromSource(
+  /**
+   * Real-exam simulation (spec 3.5). The pool is the past-exam bank only:
+   * published, origin bank, a source year inside the kind window plus a
+   * session (konkur) or lesson (final) label. Nothing the student has already
+   * answered or opened is ever served again, and no AI-generated question can
+   * appear. The available pool is split evenly across topics, boosted by one
+   * for weak topics and capped per topic, so a shallow pool yields a shorter
+   * exam instead of an over-request.
+   */
+  private async selectComprehensive(
     studentId: string,
-    opts: {
-      mode: 'konkur' | 'final';
-      sourceYear?: { gte: number };
-      limit?: number;
-    },
+    mode: 'konkur' | 'final',
   ): Promise<string[]> {
-    const conditions = [
+    const total = await this.getSimQuestionCount(mode);
+    if (total <= 0) return [];
+
+    const seenIds = await this.collectSeenQuestionIds(studentId);
+    const pool = await this.countComprehensivePool(mode, seenIds);
+    if (pool.length === 0) return [];
+
+    const weakTopicIds = new Set(await this.getWeakTopicIds(studentId));
+    const allocations = this.allocateComprehensiveTopics(
+      pool,
+      total,
+      weakTopicIds,
+    );
+
+    const selected: string[] = [];
+    for (const allocation of allocations) {
+      const rows = await this.db
+        .select({ id: question.id })
+        .from(question)
+        .where(
+          and(
+            ...this.comprehensiveConditions(mode, seenIds),
+            eq(question.topicId, allocation.topicId),
+          ),
+        )
+        .orderBy(sql`random()`)
+        .limit(allocation.count);
+      for (const row of rows) selected.push(row.id);
+    }
+
+    return this.shuffle(selected);
+  }
+
+  /**
+   * Questions the student has already met: answered rows (a time-sync row
+   * counts too, so a question that was only opened is not re-served) and
+   * mastery rows. Deduplicated in JS like the other history queries.
+   */
+  private async collectSeenQuestionIds(studentId: string): Promise<string[]> {
+    const answered = await this.db
+      .select({ questionId: response.questionId })
+      .from(response)
+      .innerJoin(attempt, eq(attempt.id, response.attemptId))
+      .where(eq(attempt.studentId, studentId));
+
+    const tracked = await this.db
+      .select({ questionId: questionMastery.questionId })
+      .from(questionMastery)
+      .where(eq(questionMastery.studentId, studentId));
+
+    const seen = new Set<string>();
+    for (const row of [...answered, ...tracked]) seen.add(row.questionId);
+    return [...seen];
+  }
+
+  /**
+   * Filters shared by the availability count and the per-topic pick, so the
+   * allocation can never promise a question the pick query would not return.
+   */
+  private comprehensiveConditions(
+    mode: 'konkur' | 'final',
+    seenIds: string[],
+  ): SQL[] {
+    const conditions: SQL[] = [
       eq(question.status, 'published'),
-      sql`${question.sourceYear} IS NOT NULL`,
+      eq(question.origin, 'bank'),
+      isNotNull(question.sourceYear),
+      sql`${question.sourceYear} >= ${SIM_SOURCE_MIN_YEAR[mode]}`,
     ];
-    if (opts.sourceYear) {
-      conditions.push(sql`${question.sourceYear} >= ${opts.sourceYear.gte}`);
+    conditions.push(
+      mode === 'konkur'
+        ? isNotNull(question.sourceSession)
+        : isNotNull(question.sourceLesson),
+    );
+    if (seenIds.length > 0) {
+      conditions.push(notInArray(question.id, seenIds));
     }
-    if (opts.mode === 'konkur') {
-      conditions.push(sql`${question.sourceSession} IS NOT NULL`);
-    } else {
-      conditions.push(sql`${question.sourceLesson} IS NOT NULL`);
-    }
+    return conditions;
+  }
 
+  /** Unseen availability per topic; topics with no eligible row are absent. */
+  private async countComprehensivePool(
+    mode: 'konkur' | 'final',
+    seenIds: string[],
+  ): Promise<{ topicId: string; available: number }[]> {
     const rows = await this.db
-      .select({ id: question.id })
+      .select({
+        topicId: question.topicId,
+        available: sql<number>`count(*)::int`,
+      })
       .from(question)
-      .where(and(...conditions))
-      .orderBy(sql`random()`)
-      .limit(opts.limit ?? MAX_QUESTIONS_PER_EXAM);
+      .where(
+        and(
+          ...this.comprehensiveConditions(mode, seenIds),
+          isNotNull(question.topicId),
+        ),
+      )
+      .groupBy(question.topicId)
+      .orderBy(question.topicId);
 
-    return rows.map((r) => r.id);
+    const pool: { topicId: string; available: number }[] = [];
+    for (const row of rows) {
+      if (row.topicId && row.available > 0) {
+        pool.push({ topicId: row.topicId, available: row.available });
+      }
+    }
+    return pool;
+  }
+
+  /**
+   * Rules 1-3 of the comprehensive spread:
+   * 1. an even baseline over every pool topic (the first `total % n` topics
+   *    take the remainder), so a topic with unseen questions is never skipped;
+   * 2. weak topics get one extra question;
+   * 3. no topic exceeds min(baseline + 1, SIM_TOPIC_CAP) or its own unseen
+   *    availability. Boosts are funded by taking one question back from
+   *    non-weak topics first, so the total never grows past the target.
+   */
+  private allocateComprehensiveTopics(
+    pool: { topicId: string; available: number }[],
+    total: number,
+    weakTopicIds: ReadonlySet<string>,
+  ): { topicId: string; count: number }[] {
+    const topics = pool.length;
+    if (topics === 0 || total <= 0) return [];
+
+    const baseline = Math.floor(total / topics);
+    const remainder = total % topics;
+    const cap = Math.min(baseline + 1, SIM_TOPIC_CAP);
+
+    const allocations = pool.map((entry, index) => ({
+      topicId: entry.topicId,
+      available: entry.available,
+      weak: weakTopicIds.has(entry.topicId),
+      count: Math.min(
+        baseline + (index < remainder ? 1 : 0),
+        cap,
+        entry.available,
+      ),
+    }));
+
+    let excess = 0;
+    for (const allocation of allocations) {
+      if (!allocation.weak) continue;
+      const ceiling = Math.min(cap, allocation.available);
+      if (allocation.count >= ceiling) continue;
+      allocation.count += 1;
+      excess += 1;
+    }
+
+    // Pay for the boosts from non-weak topics first; only when none of them
+    // has anything left to give does a weak topic give its boost back.
+    for (const weakPass of [false, true]) {
+      while (excess > 0) {
+        let trimmed = 0;
+        for (const allocation of allocations) {
+          if (excess === 0) break;
+          if (allocation.weak !== weakPass || allocation.count === 0) {
+            continue;
+          }
+          allocation.count -= 1;
+          excess -= 1;
+          trimmed += 1;
+        }
+        if (trimmed === 0) break;
+      }
+    }
+
+    return allocations
+      .filter((allocation) => allocation.count > 0)
+      .map((allocation) => ({
+        topicId: allocation.topicId,
+        count: allocation.count,
+      }));
+  }
+
+  /**
+   * Simulation length (spec 3.5) from the active app_config row: a number for
+   * both kinds, or { konkur, final } per kind, clamped to the per-exam maximum.
+   */
+  private async getSimQuestionCount(mode: 'konkur' | 'final'): Promise<number> {
+    const [row] = await this.db
+      .select({ quotas: appConfig.quotas })
+      .from(appConfig)
+      .where(eq(appConfig.isActive, true))
+      .orderBy(desc(appConfig.version))
+      .limit(1);
+
+    const quotas = row?.quotas as Record<string, unknown> | null | undefined;
+    const configured = quotas?.[SIM_QUESTION_COUNT_KEY];
+    const perKind =
+      configured && typeof configured === 'object'
+        ? (configured as Record<string, unknown>)[mode]
+        : configured;
+    const value =
+      typeof perKind === 'number' && Number.isInteger(perKind) && perKind > 0
+        ? perKind
+        : SIM_QUESTION_COUNT_DEFAULT[mode];
+    return Math.min(value, MAX_QUESTIONS_PER_EXAM);
   }
 
   private async getOrCreateTemplateId(

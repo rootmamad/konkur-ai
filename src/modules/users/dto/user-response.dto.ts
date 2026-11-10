@@ -14,6 +14,7 @@ export class UserResponseDto {
   xp: number;
   level: number;
   streak: number;
+  studiedTopicIds: string[];
   createdAt: Date;
   updatedAt: Date;
 
@@ -29,6 +30,7 @@ export class UserResponseDto {
     dto.xp = user.xp;
     dto.level = user.level;
     dto.streak = user.streak;
+    dto.studiedTopicIds = user.studiedTopicIds;
     dto.createdAt = user.createdAt;
     dto.updatedAt = user.updatedAt;
     return dto;
