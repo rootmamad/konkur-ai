@@ -43,6 +43,9 @@ import { appConfig } from '../../db/schema/app-config';
 import { QuestionType } from '../questions/enums/question-type.enum';
 import { StartExamDto, CountsDto } from './dto/start-exam.dto';
 import type { QuestionDrafterService } from '../ai/question-drafter.service';
+// Value import (not `import type`): design:paramtypes must carry the real
+// class for Nest to inject the optional dependency in production.
+import { ReferralsService } from '../referrals/referrals.service';
 import {
   ANSWER_SUBMIT_GRACE_SECONDS,
   DIAGNOSTIC_DURATION_SECONDS,
@@ -157,6 +160,7 @@ export class ExamsService {
   constructor(
     @Inject(DB) private readonly db: Db,
     @Optional() private readonly drafter?: QuestionDrafterService,
+    @Optional() private readonly referrals?: ReferralsService,
   ) {}
 
   async startExam(
@@ -459,7 +463,7 @@ export class ExamsService {
   ): Promise<{ totalScore: number; pendingDescriptive: number }> {
     const studentId = await this.requireStudentId(userId);
 
-    return this.db.transaction(async (tx) => {
+    const result = await this.db.transaction(async (tx) => {
       // Row lock: a double-click or retry cannot finish/grade twice.
       const ctx = await this.loadOwnedAttempt(tx, attemptId, studentId, true);
       this.assertInProgress(ctx.status);
@@ -481,6 +485,22 @@ export class ExamsService {
 
       return { totalScore, pendingDescriptive: descriptive.length };
     });
+
+    // Referral progression (spec §11): fire-and-forget AFTER the finish
+    // transaction commits — the same pattern as drafter.topUpForShortage.
+    // Never awaited; .catch ensures no unhandled rejection can crash the
+    // process, and the service itself logs and swallows its own errors.
+    void this.referrals
+      ?.onInviteeExamFinished(studentId)
+      ?.catch((err: unknown) =>
+        this.logger.warn(
+          `[${studentId}] Referral first_exam bonus failed: ${String(
+            err instanceof Error ? err.message : err,
+          )}`,
+        ),
+      );
+
+    return result;
   }
 
   async getExamAttempt(attemptId: string, userId: string) {
