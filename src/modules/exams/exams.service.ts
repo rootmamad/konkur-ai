@@ -46,6 +46,7 @@ import { StartExamDto, CountsDto } from './dto/start-exam.dto';
 // class for Nest to inject the optional dependency in production.
 import { QuestionDrafterService } from '../ai/question-drafter.service';
 import { ReferralsService } from '../referrals/referrals.service';
+import { SubscriptionService } from '../billing/subscription.service';
 import {
   ANSWER_SUBMIT_GRACE_SECONDS,
   DIAGNOSTIC_DURATION_SECONDS,
@@ -161,6 +162,7 @@ export class ExamsService {
     @Inject(DB) private readonly db: Db,
     @Optional() private readonly drafter?: QuestionDrafterService,
     @Optional() private readonly referrals?: ReferralsService,
+    @Optional() private readonly subscription?: SubscriptionService,
   ) {}
 
   async startExam(
@@ -560,6 +562,11 @@ export class ExamsService {
   }
 
   private async hasPaidPlan(userId: string): Promise<boolean> {
+    // Single source of truth for this predicate is SubscriptionService
+    // (spec 3.7); the inline query below is only the fallback for manual
+    // construction in unit specs (same pattern as referrals/drafter).
+    if (this.subscription) return this.subscription.hasPaidPlan(userId);
+
     const [row] = await this.db
       .select({ plan: subscription.plan })
       .from(subscription)
