@@ -78,6 +78,9 @@
     ],
     "rootDir": "src",
     "testRegex": ".*\\.spec\\.ts$",
+    "moduleNameMapper": {
+      "^@nestjs/axios$": "<rootDir>/../test-helpers/nestjs-axios.stub.ts"
+    },
     "transform": {
       "^.+\\.(t|j)s$": "ts-jest"
     },
