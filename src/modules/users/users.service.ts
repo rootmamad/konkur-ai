@@ -1,10 +1,12 @@
 import {
+  BadRequestException,
   ConflictException,
   Inject,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { and, eq, or } from 'drizzle-orm';
+import { and, desc, eq, or } from 'drizzle-orm';
+import { alias } from 'drizzle-orm/pg-core';
 import { randomInt } from 'crypto';
 
 import { DB } from '../../db/db.module';
@@ -12,6 +14,8 @@ import type { Db } from '../../db/db.module';
 import type { DbOrTx } from '../../db/types';
 import { isUniqueViolation } from '../../db/pg-errors';
 import { account } from '../../db/schema/account';
+import { referral } from '../../db/schema/referral';
+import type { Referral } from '../../db/schema/referral';
 import { student } from '../../db/schema/student';
 import { hashDevCredential } from '../auth/dev-credential';
 
@@ -27,12 +31,21 @@ export interface UserWithProfile {
   level: number;
   streak: number;
   studiedTopicIds: string[];
+  inviteCode: string;
   createdAt: Date;
   updatedAt: Date;
 }
 
+/** One row of GET /users/me/invites (spec 11). */
+export interface MyInvite {
+  inviteeName: string;
+  status: Referral['status'];
+  createdAt: Date;
+}
+
 /** Generic on purpose: must not reveal which identifier exists (spec 3.2). */
 const REGISTRATION_FAILED = 'Registration could not be completed';
+const INVALID_INVITE_CODE = 'Invite code is not valid';
 const INVITE_CODE_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 const INVITE_CODE_LENGTH = 8;
 const INVITE_CODE_MAX_TRIES = 5;
@@ -50,6 +63,7 @@ const profileColumns = {
   level: student.level,
   streak: student.streak,
   studiedTopicIds: student.studiedTopicIds,
+  inviteCode: student.inviteCode,
 };
 
 type ProfileRow = {
@@ -65,6 +79,7 @@ type ProfileRow = {
   level: number | null;
   streak: number | null;
   studiedTopicIds: string[] | null;
+  inviteCode: string | null;
 };
 
 @Injectable()
@@ -114,14 +129,48 @@ export class UsersService {
     return row.studiedTopicIds;
   }
 
+  /**
+   * Invites sent by this user (spec 11). Scoped by the inviter's account id in
+   * the WHERE clause, so a caller can only ever read their own rows.
+   */
+  async listMyInvites(userId: string): Promise<MyInvite[]> {
+    const inviter = alias(student, 'inviter');
+    const invitee = alias(student, 'invitee');
+
+    const rows = await this.db
+      .select({
+        firstName: account.firstName,
+        lastName: account.lastName,
+        status: referral.status,
+        createdAt: referral.createdAt,
+      })
+      .from(referral)
+      .innerJoin(inviter, eq(inviter.id, referral.inviterId))
+      .innerJoin(invitee, eq(invitee.id, referral.inviteeId))
+      .innerJoin(account, eq(account.id, invitee.accountId))
+      .where(eq(inviter.accountId, userId))
+      .orderBy(desc(referral.createdAt));
+
+    return rows.map((row) => ({
+      inviteeName: [row.firstName, row.lastName]
+        .filter(Boolean)
+        .join(' ')
+        .trim(),
+      status: row.status,
+      createdAt: row.createdAt,
+    }));
+  }
+
   async create(data: {
     nationalId: string;
     phoneNumber: string;
     firstName: string;
     lastName: string;
+    inviteCode?: string;
   }): Promise<UserWithProfile> {
     const mobile = data.phoneNumber.trim();
     const credentialHash = hashDevCredential(data.nationalId);
+    const { inviteCode } = data;
 
     let accountId: string;
     try {
@@ -140,6 +189,21 @@ export class UsersService {
           throw new ConflictException(REGISTRATION_FAILED);
         }
 
+        // Invite (spec 11): resolved before anything is written, inside this
+        // transaction, so an unknown code rolls back the whole registration.
+        let inviterId: string | undefined;
+        if (inviteCode) {
+          const [inviter] = await tx
+            .select({ id: student.id })
+            .from(student)
+            .where(eq(student.inviteCode, inviteCode))
+            .limit(1);
+          if (!inviter) {
+            throw new BadRequestException(INVALID_INVITE_CODE);
+          }
+          inviterId = inviter.id;
+        }
+
         const [created] = await tx
           .insert(account)
           .values({
@@ -152,10 +216,23 @@ export class UsersService {
           })
           .returning({ id: account.id });
 
-        await tx.insert(student).values({
-          accountId: created.id,
-          inviteCode: await this.generateUniqueInviteCode(tx),
-        });
+        const [createdStudent] = await tx
+          .insert(student)
+          .values({
+            accountId: created.id,
+            inviteCode: await this.generateUniqueInviteCode(tx),
+          })
+          .returning({ id: student.id });
+
+        if (inviteCode && inviterId) {
+          // Status stays at its 'registered' default: progression, the 48h
+          // bonus and the wallet are later tasks (spec 11).
+          await tx.insert(referral).values({
+            inviterId,
+            inviteeId: createdStudent.id,
+            codeUsed: inviteCode,
+          });
+        }
 
         return created.id;
       });
@@ -211,6 +288,7 @@ export class UsersService {
       level: row.level ?? 1,
       streak: row.streak ?? 0,
       studiedTopicIds: row.studiedTopicIds ?? [],
+      inviteCode: row.inviteCode ?? '',
       createdAt: row.accountCreatedAt,
       updatedAt: row.accountUpdatedAt,
     };

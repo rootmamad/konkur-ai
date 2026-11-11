@@ -15,6 +15,7 @@ export class UserResponseDto {
   level: number;
   streak: number;
   studiedTopicIds: string[];
+  inviteCode: string;
   createdAt: Date;
   updatedAt: Date;
 
@@ -31,6 +32,7 @@ export class UserResponseDto {
     dto.level = user.level;
     dto.streak = user.streak;
     dto.studiedTopicIds = user.studiedTopicIds;
+    dto.inviteCode = user.inviteCode;
     dto.createdAt = user.createdAt;
     dto.updatedAt = user.updatedAt;
     return dto;

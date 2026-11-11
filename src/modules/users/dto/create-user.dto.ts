@@ -1,4 +1,4 @@
-import { IsNotEmpty, IsString, Matches } from 'class-validator';
+import { IsNotEmpty, IsOptional, IsString, Matches } from 'class-validator';
 
 export class CreateUserDto {
   @IsString()
@@ -22,4 +22,15 @@ export class CreateUserDto {
   @IsString()
   @IsNotEmpty()
   lastName: string;
+
+  /**
+   * Optional inviter code (spec 11, 3.7). Same alphabet and length as the
+   * generated codes: 8 characters, A-Z and 0-9.
+   */
+  @IsOptional()
+  @IsString()
+  @Matches(/^[A-Z0-9]{8}$/, {
+    message: 'inviteCode must be 8 uppercase letters or digits',
+  })
+  inviteCode?: string;
 }

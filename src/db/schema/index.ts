@@ -15,5 +15,6 @@ export * from './correction';
 export * from './study';
 export * from './chat';
 export * from './billing';
+export * from './referral';
 export * from './ai-job';
 export * from './app-config';

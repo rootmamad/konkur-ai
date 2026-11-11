@@ -39,6 +39,17 @@ export class UsersController {
   }
 
   /**
+   * Invites sent by the caller (spec 11): invitee display name, status and
+   * date. Scoped to the caller's own student row inside the query.
+   */
+  @Get('me/invites')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.STUDENT)
+  listMyInvites(@CurrentUser() user: AuthenticatedUser) {
+    return this.usersService.listMyInvites(user.userId);
+  }
+
+  /**
    * Store the self-reported studied-topic list (spec 3.2 onboarding).
    * The list feeds the diagnostic (3.3); an empty array clears it.
    */

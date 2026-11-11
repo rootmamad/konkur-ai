@@ -27,6 +27,7 @@ function profileRow(overrides: Row = {}): Row {
     level: 2,
     streak: 3,
     studiedTopicIds: [TOPIC_ID],
+    inviteCode: 'AB12CD34',
     ...overrides,
   };
 }
@@ -128,6 +129,14 @@ describe('UsersService profile mapping (findById / getMe)', () => {
 
     expect(user?.studiedTopicIds).toEqual([TOPIC_ID]);
     expect(user?.streak).toBe(3);
+  });
+
+  it('maps the student invite code through to the profile', async () => {
+    const { service } = build({ profile: profileRow() });
+
+    const user = await service.findById(USER_ID);
+
+    expect(user?.inviteCode).toBe('AB12CD34');
   });
 
   it('defaults studiedTopicIds to [] when the column is null', async () => {
