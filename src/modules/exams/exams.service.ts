@@ -42,9 +42,9 @@ import { quotaUsage, subscription } from '../../db/schema/billing';
 import { appConfig } from '../../db/schema/app-config';
 import { QuestionType } from '../questions/enums/question-type.enum';
 import { StartExamDto, CountsDto } from './dto/start-exam.dto';
-import type { QuestionDrafterService } from '../ai/question-drafter.service';
 // Value import (not `import type`): design:paramtypes must carry the real
 // class for Nest to inject the optional dependency in production.
+import { QuestionDrafterService } from '../ai/question-drafter.service';
 import { ReferralsService } from '../referrals/referrals.service';
 import {
   ANSWER_SUBMIT_GRACE_SECONDS,
