@@ -15,4 +15,4 @@ async function bootstrap() {
   await app.listen(3001);
   console.log(`Swagger UI is running on: http://localhost:3001/api-docs`);
 }
-bootstrap();
+void bootstrap();

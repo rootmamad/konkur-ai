@@ -6,6 +6,10 @@ import {
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 
+import type {
+  AuthenticatedRequest,
+  AuthenticatedUser,
+} from '../decorators/current-user.decorator';
 import { ROLES_KEY } from '../decorators/roles.decorator';
 import { UserRole } from '../../modules/users/enums/user-role.enum';
 
@@ -23,12 +27,9 @@ export class RolesGuard implements CanActivate {
       return true;
     }
 
-    const request = context.switchToHttp().getRequest();
+    const request = context.switchToHttp().getRequest<AuthenticatedRequest>();
 
-    const user = request.user as {
-      userId: string;
-      role: UserRole;
-    };
+    const user = request.user as AuthenticatedUser;
 
     if (!requiredRoles.includes(user.role)) {
       throw new ForbiddenException(
