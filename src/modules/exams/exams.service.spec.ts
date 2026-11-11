@@ -116,12 +116,14 @@ describe('ExamsService quiz_after_study selection', () => {
       findSessionByKey(key: string): Promise<null>;
       hasPaidPlan(userId: string): Promise<boolean>;
       getFreeQuizLimit(): Promise<number>;
+      getFreeQuizMaxQuestions(): Promise<number>;
       countQuizUsage(studentId: string): Promise<number>;
     };
     jest.spyOn(spyTarget, 'requireStudentId').mockResolvedValue(STUDENT_ID);
     jest.spyOn(spyTarget, 'findSessionByKey').mockResolvedValue(null);
     jest.spyOn(spyTarget, 'hasPaidPlan').mockResolvedValue(false);
     jest.spyOn(spyTarget, 'getFreeQuizLimit').mockResolvedValue(3);
+    jest.spyOn(spyTarget, 'getFreeQuizMaxQuestions').mockResolvedValue(10);
     jest.spyOn(spyTarget, 'countQuizUsage').mockResolvedValue(0);
 
     const start = service.startExam(

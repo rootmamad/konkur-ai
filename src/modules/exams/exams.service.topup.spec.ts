@@ -165,6 +165,7 @@ type ExamsInternals = {
   findSessionByKey: jest.Mock<Promise<ExamSession | null>, [string]>;
   hasPaidPlan: jest.Mock<Promise<boolean>, [string]>;
   getFreeQuizLimit: jest.Mock<Promise<number>, []>;
+  getFreeQuizMaxQuestions: jest.Mock<Promise<number>, []>;
   countQuizUsage: jest.Mock<Promise<number>, [string]>;
   getWeakTopicIds: (studentId: string) => Promise<string[]>;
   maybeMutateForPersistentShortage: (
@@ -244,6 +245,9 @@ function makeService(
   internals.getFreeQuizLimit = jest
     .fn<Promise<number>, []>()
     .mockResolvedValue(3);
+  internals.getFreeQuizMaxQuestions = jest
+    .fn<Promise<number>, []>()
+    .mockResolvedValue(10);
   internals.countQuizUsage = jest
     .fn<Promise<number>, [string]>()
     .mockResolvedValue(0);

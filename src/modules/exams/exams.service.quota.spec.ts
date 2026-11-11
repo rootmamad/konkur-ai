@@ -45,6 +45,7 @@ type PrivateService = {
   findSessionByKey(key: string): Promise<ExamSession | null>;
   hasPaidPlan(userId: string): Promise<boolean>;
   getFreeQuizLimit(): Promise<number>;
+  getFreeQuizMaxQuestions(): Promise<number>;
   countQuizUsage(studentId: string): Promise<number>;
   selectQuestionIds(dto: StartExamDto, studentId: string): Promise<string[]>;
 };
@@ -106,6 +107,9 @@ function setup(options: {
     getFreeQuizLimit: jest
       .spyOn(priv, 'getFreeQuizLimit')
       .mockResolvedValue(options.limit ?? 3),
+    getFreeQuizMaxQuestions: jest
+      .spyOn(priv, 'getFreeQuizMaxQuestions')
+      .mockResolvedValue(10),
     countQuizUsage: jest
       .spyOn(priv, 'countQuizUsage')
       .mockResolvedValue(options.used ?? 0),

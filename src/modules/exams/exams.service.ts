@@ -131,6 +131,13 @@ const FREE_QUIZ_WEEKLY_DEFAULT = 3;
 const FREE_QUIZ_QUOTA_EXHAUSTED = 'سهمیه آزمونک هفتگی پلن رایگان تمام شده است';
 
 /**
+ * Free-plan per-quiz question cap (spec 10): «هرکدام حداکثر ۱۰ سؤال».
+ * Config-driven like the weekly quota; 10 is the documented default.
+ */
+const FREE_QUIZ_MAX_QUESTIONS_KEY = 'free_quiz_max_questions';
+const FREE_QUIZ_MAX_QUESTIONS_DEFAULT = 10;
+
+/**
  * Speed quiz (spec §5): a correct answer slower than this many seconds counts as
  * "correct but slow". Config-driven like every other limit; 90s is the default.
  */
@@ -213,6 +220,18 @@ export class ExamsService {
         throw new BadRequestException(
           `At most ${MAX_QUESTIONS_PER_EXAM} questions per exam`,
         );
+      }
+      if (enforceFreeQuizQuota) {
+        // Free-plan per-quiz cap (spec 10): «هرکدام حداکثر ۱۰ سؤال». Checked
+        // here — before selection and before the quota-reserving transaction —
+        // so a rejected start consumes nothing. Diagnostic and the paid-only
+        // sims never reach this branch.
+        const maxQuestions = await this.getFreeQuizMaxQuestions();
+        if (total > maxQuestions) {
+          throw new BadRequestException(
+            `سقف تعداد سوال آزمونک پلن رایگان حداکثر ${maxQuestions} سوال است`,
+          );
+        }
       }
       counts = dto.counts;
       if (dto.kind === 'speed') {
@@ -557,6 +576,27 @@ export class ExamsService {
     return typeof value === 'number' && Number.isInteger(value) && value >= 0
       ? value
       : FREE_QUIZ_WEEKLY_DEFAULT;
+  }
+
+  /**
+   * Free-plan per-quiz question cap (spec 10): «هرکدام حداکثر ۱۰ سؤال».
+   * Read from the active settings row exactly like the weekly quota; a
+   * missing or invalid (non-positive/non-integer) value falls back to the
+   * documented default of 10.
+   */
+  private async getFreeQuizMaxQuestions(): Promise<number> {
+    const [row] = await this.db
+      .select({ quotas: appConfig.quotas })
+      .from(appConfig)
+      .where(eq(appConfig.isActive, true))
+      .orderBy(desc(appConfig.version))
+      .limit(1);
+
+    const quotas = row?.quotas as Record<string, unknown> | null | undefined;
+    const value = quotas?.[FREE_QUIZ_MAX_QUESTIONS_KEY];
+    return typeof value === 'number' && Number.isInteger(value) && value > 0
+      ? value
+      : FREE_QUIZ_MAX_QUESTIONS_DEFAULT;
   }
 
   /**
