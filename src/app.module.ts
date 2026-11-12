@@ -9,6 +9,7 @@ import { ExamsModule } from './modules/exams/exams.module';
 import { AIModule } from './modules/ai/ai.module';
 import { StudyModule } from './modules/study/study.module';
 import { DashboardModule } from './modules/dashboard/dashboard.module';
+import { SupportModule } from './modules/support/support.module';
 import { DbModule } from './db/db.module';
 import { HealthModule } from './health/health.module';
 
@@ -28,6 +29,7 @@ import { HealthModule } from './health/health.module';
     ExamsModule,
     StudyModule,
     DashboardModule,
+    SupportModule,
   ],
 })
 export class AppModule {}

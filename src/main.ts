@@ -6,6 +6,7 @@ import { AppModule } from './app.module';
 const PUBLIC_OPERATIONS: Array<{ path: string; method: 'get' | 'post' }> = [
   { path: '/auth/login', method: 'post' },
   { path: '/auth/register', method: 'post' },
+  { path: '/support/tickets', method: 'post' },
 ];
 
 function setupSwagger(app: Awaited<ReturnType<typeof NestFactory.create>>) {

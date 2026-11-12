@@ -57,6 +57,13 @@
       "when": 1794360009005,
       "tag": "0007_swift_silvermane",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1794502941195,
+      "tag": "0008_careless_slipstream",
+      "breakpoints": true
     }
   ]
 }

@@ -18,3 +18,4 @@ export * from './billing';
 export * from './referral';
 export * from './ai-job';
 export * from './app-config';
+export * from './support-ticket';
