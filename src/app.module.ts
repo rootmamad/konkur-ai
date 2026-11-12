@@ -10,6 +10,7 @@ import { AIModule } from './modules/ai/ai.module';
 import { StudyModule } from './modules/study/study.module';
 import { DashboardModule } from './modules/dashboard/dashboard.module';
 import { SupportModule } from './modules/support/support.module';
+import { LandingModule } from './modules/landing/landing.module';
 import { DbModule } from './db/db.module';
 import { HealthModule } from './health/health.module';
 
@@ -30,6 +31,7 @@ import { HealthModule } from './health/health.module';
     StudyModule,
     DashboardModule,
     SupportModule,
+    LandingModule,
   ],
 })
 export class AppModule {}

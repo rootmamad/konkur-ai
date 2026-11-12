@@ -7,6 +7,8 @@ const PUBLIC_OPERATIONS: Array<{ path: string; method: 'get' | 'post' }> = [
   { path: '/auth/login', method: 'post' },
   { path: '/auth/register', method: 'post' },
   { path: '/support/tickets', method: 'post' },
+  { path: '/public/report-card-sample', method: 'get' },
+  { path: '/public/plans', method: 'get' },
 ];
 
 function setupSwagger(app: Awaited<ReturnType<typeof NestFactory.create>>) {
