@@ -12,16 +12,15 @@ import { student } from '../../db/schema/student';
 import { studyLog } from '../../db/schema/study';
 import { HistoryContextService } from '../ai/history-context.service';
 import type { WeakTopicContext } from '../ai/history-context.service';
+// Free-quiz quota pieces shared with ExamsService (spec §10) — one source, so
+// this card can never drift from the enforcement in exams.
+import {
+  FREE_QUIZ_WEEKLY_DEFAULT,
+  FREE_QUIZ_WEEKLY_KEY,
+  QUOTA_WINDOW_DAYS,
+  QUIZ_QUOTA_OPERATION,
+} from '../billing/quiz-quota.shared';
 import { StudyService } from '../study/study.service';
-
-/** Quota operation whose usage backs the free-plan quota card (spec §10). */
-const QUIZ_QUOTA_OPERATION = 'quiz';
-/** Key of the free weekly quiz cap inside `app_config.quotas`. */
-const FREE_QUIZ_WEEKLY_KEY = 'free_quiz_weekly';
-/** Documented default: "3 آزمونک در هر ۷ روز" when no active setting exists. */
-const FREE_QUIZ_WEEKLY_DEFAULT = 3;
-/** Rolling quota window in days (spec §10). */
-const QUOTA_WINDOW_DAYS = 7;
 
 export const DEFAULT_TREND_DAYS = 7;
 export const MAX_TREND_DAYS = 30;

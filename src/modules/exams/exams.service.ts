@@ -47,6 +47,12 @@ import { StartExamDto, CountsDto } from './dto/start-exam.dto';
 import { QuestionDrafterService } from '../ai/question-drafter.service';
 import { ReferralsService } from '../referrals/referrals.service';
 import { SubscriptionService } from '../billing/subscription.service';
+// Free-quiz quota pieces shared with DashboardService (spec 10) — one source.
+import {
+  FREE_QUIZ_WEEKLY_DEFAULT,
+  FREE_QUIZ_WEEKLY_KEY,
+  QUIZ_QUOTA_OPERATION,
+} from '../billing/quiz-quota.shared';
 import {
   ANSWER_SUBMIT_GRACE_SECONDS,
   DIAGNOSTIC_DURATION_SECONDS,
@@ -124,14 +130,7 @@ const DIAGNOSTIC_DIFFICULTY_LEVEL = 1;
  */
 const AI_MAX_SHARE = 0.5;
 
-/**
- * Free-plan quiz quota (spec section 10). The authoritative numbers live in the
- * active app_config row; the value below is only the documented default for
- * "3 آزمونک در هر ۷ روز" when no active setting exists yet.
- */
-const QUIZ_QUOTA_OPERATION = 'quiz';
-const FREE_QUIZ_WEEKLY_KEY = 'free_quiz_weekly';
-const FREE_QUIZ_WEEKLY_DEFAULT = 3;
+/** Persian 403 message when the free quiz quota is exhausted (spec 10). */
 const FREE_QUIZ_QUOTA_EXHAUSTED = 'سهمیه آزمونک هفتگی پلن رایگان تمام شده است';
 
 /**
