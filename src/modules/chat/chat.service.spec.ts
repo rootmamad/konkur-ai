@@ -7,8 +7,10 @@ import type { SQL } from 'drizzle-orm';
 import { PgDialect } from 'drizzle-orm/pg-core';
 
 import type { Db } from '../../db/db.module';
+import { attempt } from '../../db/schema/attempt';
 import { chatMessage, chatThread } from '../../db/schema/chat';
 import { appConfig } from '../../db/schema/app-config';
+import { question } from '../../db/schema/question';
 import { student } from '../../db/schema/student';
 import { SubscriptionService } from '../billing/subscription.service';
 import { ChatAiService } from './chat-ai.service';
@@ -31,7 +33,14 @@ const TABLES: Record<string, unknown> = {
   chatThread,
   chatMessage,
   appConfig,
+  attempt,
+  question,
 };
+
+/** A question row the ref-ownership check accepts (published, in the bank). */
+const publishedQuestion = { id: QUESTION_ID, status: 'published' };
+/** An attempt row the ref-ownership check accepts (owned by the caller). */
+const ownedAttempt = { id: ATTEMPT_ID, studentId: STUDENT_ID };
 
 function makeDb(fixtures: Record<string, Row[][]> = {}) {
   const queues = new Map<unknown, Row[][]>();
@@ -138,6 +147,7 @@ describe('ChatService — get-or-create (spec 9.1)', () => {
   it('returns the existing thread for the exact key without inserting', async () => {
     const existing = threadRow();
     const { db, transaction, conditions, inserted } = makeDb({
+      question: [[publishedQuestion]],
       chatThread: [[existing]],
     });
     const service = new ChatService(db);
@@ -151,17 +161,23 @@ describe('ChatService — get-or-create (spec 9.1)', () => {
     expect(result).toEqual(existing);
     expect(transaction).toHaveBeenCalledTimes(1);
     expect(inserted).toHaveLength(0);
-    const where = text(conditions[0]);
+    const threadWhere = conditions.find((condition) =>
+      text(condition).includes('"chat_thread"."question_id"'),
+    );
+    const where = text(threadWhere);
     expect(where).toContain('"chat_thread"."student_id" =');
     expect(where).toContain('"chat_thread"."space" =');
     expect(where).toContain('"chat_thread"."question_id" =');
-    expect(params(conditions[0])).toContain('question');
-    expect(params(conditions[0])).toContain(QUESTION_ID);
+    expect(params(conditions[0])).toContain('published');
+    expect(params(threadWhere)).toContain('question');
+    expect(params(threadWhere)).toContain(QUESTION_ID);
   });
 
   it('creates the thread inside ONE transaction when the key is new', async () => {
     const created = threadRow({ id: 'new-thread' });
     const { db, transaction, inserted } = makeDb({
+      attempt: [[ownedAttempt]],
+      question: [[publishedQuestion]],
       chatThread: [[], [created]],
     });
     const service = new ChatService(db);
@@ -188,7 +204,10 @@ describe('ChatService — get-or-create (spec 9.1)', () => {
   it('is idempotent per key — the same call shape never inserts twice', async () => {
     // Second call: the row created by the first call is found.
     const created = threadRow();
-    const { db, inserted } = makeDb({ chatThread: [[created]] });
+    const { db, inserted } = makeDb({
+      question: [[publishedQuestion]],
+      chatThread: [[created]],
+    });
     const service = new ChatService(db);
 
     await expect(
@@ -209,7 +228,10 @@ describe('ChatService — get-or-create (spec 9.1)', () => {
   });
 
   it('keys an exam_analysis thread by attempt and empty question ref', async () => {
-    const { db, conditions } = makeDb({ chatThread: [[threadRow()]] });
+    const { db, conditions } = makeDb({
+      attempt: [[ownedAttempt]],
+      chatThread: [[threadRow()]],
+    });
     const service = new ChatService(db);
 
     await service.getOrCreateThread(
@@ -219,10 +241,12 @@ describe('ChatService — get-or-create (spec 9.1)', () => {
       ATTEMPT_ID,
     );
 
-    const where = text(conditions[0]);
-    expect(where).toContain('"chat_thread"."attempt_id" =');
-    expect(where).toContain('"chat_thread"."question_id" is null');
-    expect(params(conditions[0])).toContain(ATTEMPT_ID);
+    const threadWhere = conditions.find((condition) =>
+      text(condition).includes('"chat_thread"."attempt_id"'),
+    );
+    expect(text(threadWhere)).toContain('"chat_thread"."attempt_id" =');
+    expect(text(threadWhere)).toContain('"chat_thread"."question_id" is null');
+    expect(params(threadWhere)).toContain(ATTEMPT_ID);
   });
 });
 
@@ -260,7 +284,16 @@ describe('ChatService — per-space validation matrix (spec 9.1)', () => {
   it.each(valid)(
     'accepts space=%s questionId=%s attemptId=%s',
     async (space, questionId, attemptId) => {
-      const { db } = makeDb({ chatThread: [[threadRow({ space })]] });
+      const { db } = makeDb({
+        chatThread: [[threadRow({ space })]],
+        // Ref checks only run for the spaces that carry those refs.
+        ...(attemptId
+          ? { attempt: [[{ id: attemptId, studentId: STUDENT_ID }]] }
+          : {}),
+        ...(questionId
+          ? { question: [[{ id: questionId, status: 'published' }]] }
+          : {}),
+      });
       const service = new ChatService(db);
 
       await expect(
@@ -730,5 +763,90 @@ describe('ChatService — free-plan AI quota (spec §10)', () => {
     await expect(service.getMessages(USER_ID, THREAD_ID)).resolves.toEqual(
       rows,
     );
+  });
+});
+
+describe('ChatService — context-ref ownership (spec 15.5)', () => {
+  it('rejects a foreign attemptId at creation with 404 and stores nothing', async () => {
+    // No attempt visible to THIS student — unknown and foreign read alike.
+    const { db, inserted } = makeDb({ attempt: [[]] });
+    const service = new ChatService(db);
+
+    await expect(
+      service.getOrCreateThread(
+        USER_ID,
+        'exam_analysis',
+        undefined,
+        ATTEMPT_ID,
+      ),
+    ).rejects.toBeInstanceOf(NotFoundException);
+
+    expect(inserted).toHaveLength(0);
+  });
+
+  it('rejects an unknown questionId at creation with 404 and stores nothing', async () => {
+    const { db, inserted } = makeDb({ question: [[]] });
+    const service = new ChatService(db);
+
+    await expect(
+      service.getOrCreateThread(USER_ID, 'question', QUESTION_ID),
+    ).rejects.toBeInstanceOf(NotFoundException);
+
+    expect(inserted).toHaveLength(0);
+  });
+
+  it('creates the thread only past the ownership + published checks', async () => {
+    const created = threadRow({
+      space: 'question',
+      attemptId: ATTEMPT_ID,
+    });
+    const { db, inserted, conditions } = makeDb({
+      attempt: [[ownedAttempt]],
+      question: [[publishedQuestion]],
+      chatThread: [[], [created]],
+    });
+    const service = new ChatService(db);
+
+    const result = await service.getOrCreateThread(
+      USER_ID,
+      'question',
+      QUESTION_ID,
+      ATTEMPT_ID,
+    );
+
+    expect(result).toEqual(created);
+    expect(inserted).toHaveLength(1);
+    // The attempt guard is scoped to the CALLER's student id.
+    const attemptGuard = conditions.find((condition) =>
+      text(condition).includes('"attempt"."student_id"'),
+    );
+    expect(params(attemptGuard)).toContain(ATTEMPT_ID);
+    expect(params(attemptGuard)).toContain(STUDENT_ID);
+    // The question guard requires a PUBLISHED bank row.
+    const questionGuard = conditions.find((condition) =>
+      text(condition).includes('"question"."status"'),
+    );
+    expect(params(questionGuard)).toContain(QUESTION_ID);
+    expect(params(questionGuard)).toContain('published');
+  });
+
+  it('checks refs before any thread read — a foreign ref never reaches the key', async () => {
+    const { db, conditions, inserted } = makeDb({ attempt: [[]] });
+    const service = new ChatService(db);
+
+    await expect(
+      service.getOrCreateThread(
+        USER_ID,
+        'exam_analysis',
+        undefined,
+        ATTEMPT_ID,
+      ),
+    ).rejects.toBeInstanceOf(NotFoundException);
+
+    // No chat_thread query ran at all: the guard fired first.
+    expect(
+      conditions.some((condition) => text(condition).includes('"chat_thread"')),
+    ).toBe(false);
+    expect(inserted).toHaveLength(0);
   });
 });

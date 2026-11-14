@@ -371,8 +371,18 @@ export class ChatAiService {
     }
 
     // Layer 3 — the student's REAL response (attempt-scoped else latest).
-    const resp = thread.attemptId
-      ? await this.findResponseInAttempt(thread.attemptId, thread.questionId)
+    // Defense in depth (spec 15.5): never trust the thread's attemptId ref
+    // alone — attempt-scoped response/correction data is read only when the
+    // attempt is verified to belong to THIS student; anything else degrades
+    // to the caller-scoped latest-response read, so no cross-student exam
+    // data can enter a prompt.
+    const ownedAttemptId =
+      thread.attemptId &&
+      (await this.attemptOwnedBy(thread.attemptId, studentId))
+        ? thread.attemptId
+        : null;
+    const resp = ownedAttemptId
+      ? await this.findResponseInAttempt(ownedAttemptId, thread.questionId)
       : await this.findLatestResponse(studentId, thread.questionId);
     if (resp) {
       context.userResponse = {
@@ -408,6 +418,19 @@ export class ChatAiService {
         })),
     };
     return context;
+  }
+
+  /** True only when the attempt exists AND belongs to this student (15.5). */
+  private async attemptOwnedBy(
+    attemptId: string,
+    studentId: string,
+  ): Promise<boolean> {
+    const [row] = await this.db
+      .select({ id: attempt.id })
+      .from(attempt)
+      .where(and(eq(attempt.id, attemptId), eq(attempt.studentId, studentId)))
+      .limit(1);
+    return row !== undefined;
   }
 
   /** The response inside the thread's attempt (spec 15.4 scoping). */

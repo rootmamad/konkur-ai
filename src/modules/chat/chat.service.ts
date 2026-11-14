@@ -14,6 +14,8 @@ import type { Db } from '../../db/db.module';
 import { chatMessage, chatThread } from '../../db/schema/chat';
 import type { ChatMessage, ChatThread } from '../../db/schema/chat';
 import { appConfig } from '../../db/schema/app-config';
+import { attempt } from '../../db/schema/attempt';
+import { question } from '../../db/schema/question';
 import { student } from '../../db/schema/student';
 import type { DbOrTx } from '../../db/types';
 // Value import (not `import type`): design:paramtypes must carry the real
@@ -135,6 +137,10 @@ export class ChatService {
     const studentId = await this.resolveStudentId(userId);
 
     return this.db.transaction(async (tx) => {
+      // Context refs must exist AND belong to the caller (spec 15.5) —
+      // verified before any thread is read or written, in this transaction.
+      await this.requireOwnedRefs(tx, studentId, questionId, attemptId);
+
       const [existing] = await tx
         .select()
         .from(chatThread)
@@ -320,6 +326,40 @@ export class ChatService {
         ),
       );
     return row?.count ?? 0;
+  }
+
+  /**
+   * Context-ref ownership (spec 15.5): the floating chat keys to a PUBLISHED
+   * bank question, and an exam_analysis thread keys to an attempt the caller
+   * OWNS. Both checks run before any thread is created, so no cross-student
+   * exam data can ever be keyed into a chat thread. Existence, ownership and
+   * publish state all read as a 404 — a foreign ref must be
+   * indistinguishable from a missing one.
+   */
+  private async requireOwnedRefs(
+    executor: DbOrTx,
+    studentId: string,
+    questionId?: string,
+    attemptId?: string,
+  ): Promise<void> {
+    if (attemptId !== undefined) {
+      const [owned] = await executor
+        .select({ id: attempt.id })
+        .from(attempt)
+        .where(and(eq(attempt.id, attemptId), eq(attempt.studentId, studentId)))
+        .limit(1);
+      if (!owned) throw new NotFoundException('Attempt not found');
+    }
+    if (questionId !== undefined) {
+      const [published] = await executor
+        .select({ id: question.id })
+        .from(question)
+        .where(
+          and(eq(question.id, questionId), eq(question.status, 'published')),
+        )
+        .limit(1);
+      if (!published) throw new NotFoundException('Question not found');
+    }
   }
 
   /** 404 unless the thread exists AND belongs to this student (spec 15.5). */

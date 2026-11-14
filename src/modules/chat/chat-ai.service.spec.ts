@@ -30,6 +30,11 @@ const RESPONSE_ID = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d';
 
 const dialect = new PgDialect();
 
+const text = (condition: SQL | undefined): string =>
+  condition ? dialect.sqlToQuery(condition).sql.toLowerCase() : '';
+const params = (condition: SQL | undefined): unknown[] =>
+  condition ? dialect.sqlToQuery(condition).params : [];
+
 type Row = Record<string, unknown>;
 
 /** FIFO result set per table; terminal `.limit(n)` slices the set. */
@@ -161,6 +166,8 @@ function build(
 describe('ChatAiService — prompt assembly (spec 9.2)', () => {
   it('sends the seven clauses verbatim, the answer key and the real answer', async () => {
     const { service, runJob } = build({
+      // The thread's attempt is owned by the caller → attempt-scoped read.
+      attempt: [[{ id: ATTEMPT_ID, studentId: STUDENT_ID }]],
       question: [
         [
           {
@@ -325,6 +332,52 @@ describe('ChatAiService — prompt assembly (spec 9.2)', () => {
     const prompt = (runJob.mock.calls[0][0] as { prompt: string }).prompt;
     expect(prompt).toContain('در دسترس نیست');
     expect(prompt).toContain('در بانک سؤال ثبت نشده است');
+  });
+
+  it('reads nothing from an attempt that is not the caller’s (defense in depth)', async () => {
+    // A pre-existing thread whose attemptId ref points at data this student
+    // does not own: the ownership guard finds nothing, so the attempt-scoped
+    // response/correction layers are skipped entirely (spec 15.5).
+    const { service, runJob, conditions } = build({
+      attempt: [[]], // no attempt owned by THIS student is visible
+      question: [
+        [
+          {
+            id: QUESTION_ID,
+            version: 1,
+            text: 'سؤال',
+            type: 'multiple_choice',
+            options: [],
+          },
+        ],
+      ],
+      response: [[]],
+      chatMessage: [[]],
+    });
+
+    const reply = await service.reply(threadRow(), STUDENT_ID);
+
+    expect(reply).toBe('پاسخ دستیار');
+    // The ownership guard ran, scoped to the caller's student id.
+    const guard = conditions.find((condition) => {
+      const where = text(condition);
+      return (
+        where.includes('"attempt"."id"') &&
+        where.includes('"attempt"."student_id"') &&
+        !where.includes('"response"')
+      );
+    });
+    expect(guard).toBeDefined();
+    expect(params(guard)).toContain(ATTEMPT_ID);
+    expect(params(guard)).toContain(STUDENT_ID);
+    // The attempt-scoped response read never ran — no foreign exam data can
+    // reach the prompt; only the caller-scoped latest-response fallback.
+    expect(
+      conditions.some((condition) =>
+        text(condition).includes('"response"."attempt_id"'),
+      ),
+    ).toBe(false);
+    expect(runJob).toHaveBeenCalledTimes(1);
   });
 });
 
