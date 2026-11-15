@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, desc, eq } from 'drizzle-orm';
+import { and, desc, eq, sql } from 'drizzle-orm';
 
 import { DB } from '../../db/db.module';
 import type { Db } from '../../db/db.module';
@@ -11,8 +11,11 @@ import { correction } from '../../db/schema/correction';
 import { question } from '../../db/schema/question';
 import { response } from '../../db/schema/response';
 import { rubric } from '../../db/schema/rubric';
+import { student } from '../../db/schema/student';
+import { studyLog } from '../../db/schema/study';
 import { AIService } from '../ai/ai.service';
 import { HistoryContextService } from '../ai/history-context.service';
+import type { HistoryContext } from '../ai/history-context.service';
 
 /**
  * The seven-clause block (spec 9.2, «عینا»): VERBATIM in every chat prompt —
@@ -25,6 +28,45 @@ export const SEVEN_CLAUSES =
 export const CHAT_PROMPT_VERSION = 'chat-v1';
 /** Operation label (spec §12; `question_chat` already exists in the enum). */
 export const CHAT_OPERATION = 'question_chat' as const;
+
+/**
+ * The three coach composer tabs (spec 9.1): every coach send is explicit
+ * about which mode produced it — the prompt layers differ per mode.
+ */
+export const COACH_MODES = ['motivation', 'planning', 'debug'] as const;
+export type CoachMode = (typeof COACH_MODES)[number];
+/** Operation label for coach-space replies (exists in `ai_operation`). */
+export const COACH_OPERATION = 'coach' as const;
+/** Prompt revision tag for coach replies. */
+export const COACH_PROMPT_VERSION = 'coach-v1';
+/** Persian display label per mode (used in the prompt header). */
+const COACH_MODE_LABEL: Record<CoachMode, string> = {
+  motivation: 'انگیزشی',
+  planning: 'برنامه‌ریزی',
+  debug: 'رفع اشکال',
+};
+
+/**
+ * The mode's own قواعد (spec 9.1): each mode adds one rule line on top of
+ * the seven clauses — what the reply may and may not do in that mode.
+ */
+export const COACH_MODE_RULES: Record<CoachMode, string> = {
+  motivation:
+    'فقط با اعداد داده‌شده دلگرمی بساز؛ هیچ عدد یا دستاورد جدیدی نساز و فهرست ضعف‌ها را تکرار نکن.',
+  planning:
+    'برنامه پیشنهادی را به موضوعات ضعیف داده‌شده گره بزن؛ هیچ کمیت، ساعت یا ترتیبی از خودت نساز؛ برای هر بخش نامشخص سؤال روشن‌کننده بپرس.',
+  debug:
+    'تشخیص را فقط از نمونه پاسخ‌های غلط داده‌شده بساز؛ اگر از دلیل خطا مطمئن نیستی، سؤال روشن‌کننده بپرس.',
+};
+
+/**
+ * Bounded lazy reads for the coach prompt (spec §13.3): the study-log window,
+ * how many recent titles the planning layer keeps, and how many self-reported
+ * studied-topic ids are rendered.
+ */
+export const COACH_ACTIVITY_WINDOW_DAYS = 7;
+export const COACH_STUDY_TITLES_LIMIT = 5;
+export const COACH_STUDIED_TOPICS_LIMIT = 10;
 
 /**
  * Spec 9.1: «تمام تاریخچه در هر درخواست ارسال نمی‌شود» — only the LAST this
@@ -266,13 +308,130 @@ export function buildQuestionChatPrompt(input: {
   return lines.join('\n');
 }
 
+/** Fixed profile layer of the coach prompt (student table row, spec 9.1). */
+export interface CoachStudentProfile {
+  major: string | null;
+  grade: string | null;
+  targetYear: number | null;
+  streak: number;
+  studiedTopicIds: string[];
+}
+
+/** Everything one coach reply needs, resolved lazily per mode. */
+export interface CoachChatPromptInput {
+  mode: CoachMode;
+  /** Fixed layer: profile row (null when the profile is missing). */
+  profile: CoachStudentProfile | null;
+  /** Summary layer from HistoryContextService (streak lives on the profile). */
+  summary: HistoryContext | null;
+  /** motivation only: study-log entries in the last 7 days. */
+  activityCount7d: number | null;
+  /** planning only: recent study-log titles, newest first. */
+  studyTitles: string[] | null;
+  /** ONLY the last CHAT_HISTORY_WINDOW thread messages, ascending. */
+  history: ChatMessage[];
+}
+
+/**
+ * Build the coach chat prompt (spec 9.1): fixed profile layer, summary
+ * layer, and the mode's lazy layer — motivation carries COUNTS only (a pep
+ * talk never dumps wrong-answer data), planning adds studied topics + recent
+ * study titles, debug adds the weak topics' sample wrong answers. Each mode
+ * adds its own rule line on top of the seven clauses (verbatim). Pure and
+ * exported so the assembled prompt is testable without a model call.
+ */
+export function buildCoachChatPrompt(input: CoachChatPromptInput): string {
+  const { mode, profile, summary } = input;
+  const lines: string[] = [
+    'تو دبیر باتجربه کنکور هستی و در چتِ مربی به دانش‌آموز پاسخ می‌دهی.',
+    `حالت این پاسخ: ${COACH_MODE_LABEL[mode]}`,
+    '',
+    'قواعد زیر را عینا در همه پاسخ‌ها رعایت کن:',
+    SEVEN_CLAUSES,
+    '',
+    'قواعد مخصوص این حالت:',
+    `- ${COACH_MODE_RULES[mode]}`,
+    '',
+  ];
+
+  // Fixed layer — strand/grade/target-year + streak (one profile read).
+  lines.push(
+    'پروفایل دانش‌آموز:',
+    `- رشته: ${profile?.major ?? 'نامشخص'}`,
+    `- پایه: ${profile?.grade ?? 'نامشخص'}`,
+    `- سال هدف کنکور: ${profile?.targetYear ?? 'نامشخص'}`,
+    `- استریک فعلی: ${profile?.streak ?? 0} روز`,
+    '',
+  );
+
+  // Summary layer — rendered per mode (spec 9.1: lazily, per operation).
+  lines.push('خلاصه سابقه دانش‌آموز:');
+  if (mode === 'motivation') {
+    // COUNTS only: no topic titles, no samples (a pep talk dumps no data).
+    lines.push(
+      `- مجموع خطاهای اخیر: ${summary?.totalWrong ?? 0}`,
+      `- موضوعات نیازمند تمرین: ${summary?.weakTopics.length ?? 0} موضوع`,
+      `- مطالعات ثبت‌شده در ۷ روز گذشته: ${input.activityCount7d ?? 0} مورد`,
+    );
+  } else if (summary && summary.weakTopics.length > 0) {
+    for (const topic of summary.weakTopics.slice(0, CHAT_SUMMARY_WEAK_TOPICS)) {
+      lines.push(
+        `- ${topic.topicTitle ?? 'مبحث نامشخص'}: ${topic.wrongCount} خطا`,
+      );
+      // debug only: the retained sample wrong-answer texts (already capped
+      // by HistoryContextService at 300 chars each).
+      if (mode === 'debug') {
+        for (const sample of topic.sampleWrongTexts) {
+          lines.push(`  · نمونه: ${sample}`);
+        }
+      }
+    }
+    lines.push(`مجموع خطاهای اخیر: ${summary.totalWrong}`);
+  } else {
+    lines.push('- موضوع ضعیفی در بازه اخیر ثبت نشده است.');
+  }
+  if (mode === 'planning') {
+    const studied = (profile?.studiedTopicIds ?? []).slice(
+      0,
+      COACH_STUDIED_TOPICS_LIMIT,
+    );
+    if (studied.length > 0) {
+      lines.push(`موضوعات مطالعه‌شده (خوداعلامی): ${studied.join('، ')}`);
+    }
+    if (input.studyTitles && input.studyTitles.length > 0) {
+      lines.push(
+        'مطالعات اخیر (۷ روز گذشته):',
+        ...input.studyTitles.map((title) => `- ${title}`),
+      );
+    }
+  }
+  lines.push('');
+
+  // History window: same last-10 rule as the question chat, ascending.
+  if (input.history.length > 0) {
+    lines.push(
+      'تاریخچه گفتگو (آخرین پیام‌ها):',
+      ...input.history.map((message) =>
+        message.role === 'user'
+          ? `دانش‌آموز: ${message.body}`
+          : `دستیار: ${message.body}`,
+      ),
+      '',
+    );
+  }
+
+  lines.push(
+    'به آخرین پیام دانش‌آموز پاسخ بده: فقط متن فارسی پاسخ را بده؛ بدون JSON و بدون متن اضافه.',
+  );
+  return lines.join('\n');
+}
+
 /**
  * AI side of the question-space chat (spec 9.1/9.2): assembles the lazily
  * scoped context layers + the trimmed history window, then runs ONE logged
  * model call (`question_chat`, `chat-v1`). Storage/quota stay outside — the
  * caller (ChatService) persists around this call and owns the failure path.
- */
-@Injectable()
+ */ @Injectable()
 export class ChatAiService {
   constructor(
     @Inject(DB) private readonly db: Db,
@@ -296,6 +455,108 @@ export class ChatAiService {
       prompt,
       parse: parseChatReply,
     });
+  }
+
+  /**
+   * One AI reply for a coach-space thread (spec 9.1): fixed profile layer +
+   * summary layer + the mode's lazy layer → prompt → ONE logged model call
+   * (`coach`, `coach-v1`). Same contract as {@link reply}: throws on
+   * failure; the caller keeps the stored user message and reports
+   * `ai_unavailable`. The free-plan quota is the caller's concern.
+   */
+  async replyCoach(
+    thread: ChatThread,
+    studentId: string,
+    mode: CoachMode,
+  ): Promise<string> {
+    const profile = await this.loadCoachProfile(studentId);
+    const summary = await this.historyContext.buildForStudent(studentId);
+    const history = await this.loadRecentMessages(thread.id);
+
+    // Lazy layer — only what THIS mode consumes (spec §13.3).
+    const activityCount7d =
+      mode === 'motivation' ? await this.countRecentStudyLog(studentId) : null;
+    const studyTitles =
+      mode === 'planning' ? await this.loadRecentStudyTitles(studentId) : null;
+
+    const prompt = buildCoachChatPrompt({
+      mode,
+      profile,
+      summary,
+      activityCount7d,
+      studyTitles,
+      history,
+    });
+
+    return this.aiService.runJob<string>({
+      operation: COACH_OPERATION,
+      promptVersion: COACH_PROMPT_VERSION,
+      prompt,
+      parse: parseChatReply,
+    });
+  }
+
+  /** Fixed layer: strand/grade/target-year + streak + studied topics. */
+  private async loadCoachProfile(
+    studentId: string,
+  ): Promise<CoachStudentProfile | null> {
+    const [row] = await this.db
+      .select({
+        major: student.major,
+        grade: student.grade,
+        targetYear: student.targetYear,
+        streak: student.streak,
+        studiedTopicIds: student.studiedTopicIds,
+      })
+      .from(student)
+      .where(eq(student.id, studentId))
+      .limit(1);
+    if (!row) return null;
+    return {
+      major: row.major,
+      grade: row.grade,
+      targetYear: row.targetYear,
+      streak: row.streak,
+      studiedTopicIds: Array.isArray(row.studiedTopicIds)
+        ? row.studiedTopicIds
+        : [],
+    };
+  }
+
+  /** Motivation layer: how many study-log entries the last 7 days hold. */
+  private async countRecentStudyLog(studentId: string): Promise<number> {
+    const [row] = await this.db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(studyLog)
+      .where(
+        and(
+          eq(studyLog.studentId, studentId),
+          sql`${studyLog.doneAt} >= now() - interval '${sql.raw(
+            String(COACH_ACTIVITY_WINDOW_DAYS),
+          )} days'`,
+        ),
+      );
+    return row?.count ?? 0;
+  }
+
+  /** Planning layer: recent study-log titles, newest first, capped. */
+  private async loadRecentStudyTitles(studentId: string): Promise<string[]> {
+    const rows = await this.db
+      .select({ lesson: studyLog.lesson, topic: studyLog.topic })
+      .from(studyLog)
+      .where(
+        and(
+          eq(studyLog.studentId, studentId),
+          sql`${studyLog.doneAt} >= now() - interval '${sql.raw(
+            String(COACH_ACTIVITY_WINDOW_DAYS),
+          )} days'`,
+        ),
+      )
+      .orderBy(desc(studyLog.doneAt))
+      .limit(COACH_STUDY_TITLES_LIMIT);
+    return rows.map((row) =>
+      row.topic ? `${row.lesson} — ${row.topic}` : row.lesson,
+    );
   }
 
   /**

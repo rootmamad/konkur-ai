@@ -95,14 +95,15 @@ export class ChatController {
 
   @Post('threads/:id/messages')
   @ApiOperation({
-    summary: "Append the caller's user message to a thread (owner-only)",
+    summary:
+      "Append the caller's user message to a thread (owner-only; coach sends take a mode)",
   })
   addMessage(
     @CurrentUser() user: AuthenticatedUser,
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: CreateMessageDto,
   ) {
-    return this.chatService.addMessage(user.userId, id, dto.body);
+    return this.chatService.addMessage(user.userId, id, dto.body, dto.mode);
   }
 }
 

@@ -22,6 +22,7 @@ import type { DbOrTx } from '../../db/types';
 // class for Nest to inject the optional dependency in production.
 import { SubscriptionService } from '../billing/subscription.service';
 import { ChatAiService } from './chat-ai.service';
+import type { CoachMode } from './chat-ai.service';
 import type { ChatSpaceKind } from './dto/create-thread.dto';
 
 /** Chat message length cap (spec 9.1): a user message is 1..2000 chars. */
@@ -210,12 +211,17 @@ export class ChatService {
   }
 
   /**
-   * Persist the caller's message, then — for question-space threads — run the
-   * AI reply pipeline (spec 9.1/9.2): context → model → assistant row. On ANY
-   * AI failure the user message stays stored and the response carries
+   * Persist the caller's message, then run the AI reply pipeline for the
+   * spaces that have one (spec 9.1/9.2): question → `reply`, coach →
+   * `replyCoach(thread, studentId, mode)`; exam_analysis stays storage-only.
+   * On ANY AI failure the user message stays stored and the response carries
    * `notice: 'ai_unavailable'` — stored data is never lost and the request
-   * never 500s (spec 15.5). coach/exam_analysis keep the storage-only path.
-   * Owner-only: another student's thread is a 404.
+   * never 500s (spec 15.5). Owner-only: another student's thread is a 404.
+   *
+   * Mode matrix (spec 9.1): the coach composer is explicit about which of
+   * the three tabs produced the send, so a coach message without `mode` is
+   * a 400; `mode` on any other space is a 400. Checked before the quota
+   * read: a rejected send stores nothing.
    *
    * Free-plan quota (spec §10): coach/question sends consume the shared
    * 5-per-7-days pool. The count and the user-message insert run in ONE
@@ -229,9 +235,19 @@ export class ChatService {
     userId: string,
     threadId: string,
     body: string,
+    mode?: CoachMode,
   ): Promise<AddMessageResult> {
     const studentId = await this.resolveStudentId(userId);
     const thread = await this.requireOwnedThread(threadId, studentId);
+
+    if (thread.space === 'coach' && mode === undefined) {
+      throw new BadRequestException(
+        'coach messages require a mode (motivation, planning or debug)',
+      );
+    }
+    if (thread.space !== 'coach' && mode !== undefined) {
+      throw new BadRequestException('mode is only valid on coach threads');
+    }
 
     const quotaApplies =
       thread.space !== 'exam_analysis' && !(await this.hasPaidPlan(userId));
@@ -256,12 +272,15 @@ export class ChatService {
       return created;
     });
 
-    if (thread.space !== 'question' || !this.chatAi) {
+    if (!this.chatAi || thread.space === 'exam_analysis') {
       return { userMessage, assistantMessage: null };
     }
 
     try {
-      const reply = await this.chatAi.reply(thread, studentId);
+      const reply =
+        thread.space === 'coach'
+          ? await this.chatAi.replyCoach(thread, studentId, mode as CoachMode)
+          : await this.chatAi.reply(thread, studentId);
       const [assistantMessage] = await this.db
         .insert(chatMessage)
         .values({ threadId, role: 'assistant', body: reply })
@@ -269,7 +288,7 @@ export class ChatService {
       return { userMessage, assistantMessage };
     } catch (err: unknown) {
       this.logger.warn(
-        `[${threadId}] question_chat reply failed (user message kept): ${
+        `[${threadId}] ${thread.space} chat reply failed (user message kept): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );

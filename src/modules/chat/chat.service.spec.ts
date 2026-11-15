@@ -138,6 +138,17 @@ function makeChatAi(reply: () => Promise<string>) {
   return { chatAi: { reply: replyFn } as unknown as ChatAiService, replyFn };
 }
 
+/** SubscriptionService stub around one hasPaidPlan answer. */
+function makeSubscription(paid: boolean) {
+  const hasPaidPlan = jest
+    .fn<Promise<boolean>, [string]>()
+    .mockResolvedValue(paid);
+  return {
+    service: { hasPaidPlan } as unknown as SubscriptionService,
+    hasPaidPlan,
+  };
+}
+
 const text = (condition: SQL | undefined): string =>
   condition ? dialect.sqlToQuery(condition).sql.toLowerCase() : '';
 const params = (condition: SQL | undefined): unknown[] =>
@@ -430,13 +441,7 @@ describe('ChatService — caller resolution', () => {
 
 describe('ChatService — AI reply pipeline (spec 9.1/9.2)', () => {
   /** These tests target the AI path; the quota is bypassed via a paid plan. */
-  function paidSubscription() {
-    return {
-      hasPaidPlan: jest
-        .fn<Promise<boolean>, [string]>()
-        .mockResolvedValue(true),
-    } as unknown as SubscriptionService;
-  }
+  const paidSub = () => makeSubscription(true).service;
 
   it('persists the assistant row with role assistant on question threads', async () => {
     const userStored = messageRow({ body: 'چرا این غلطه؟' });
@@ -453,7 +458,7 @@ describe('ChatService — AI reply pipeline (spec 9.1/9.2)', () => {
     const { chatAi, replyFn } = makeChatAi(() =>
       Promise.resolve('پاسخ دستیار'),
     );
-    const service = new ChatService(db, chatAi, paidSubscription());
+    const service = new ChatService(db, chatAi, paidSub());
 
     const result = await service.addMessage(
       USER_ID,
@@ -484,7 +489,7 @@ describe('ChatService — AI reply pipeline (spec 9.1/9.2)', () => {
     const { chatAi } = makeChatAi(() =>
       Promise.reject(new Error('model down')),
     );
-    const service = new ChatService(db, chatAi, paidSubscription());
+    const service = new ChatService(db, chatAi, paidSub());
 
     const result = await service.addMessage(
       USER_ID,
@@ -501,22 +506,24 @@ describe('ChatService — AI reply pipeline (spec 9.1/9.2)', () => {
     expect(inserted[0].values).toMatchObject({ role: 'user' });
   });
 
-  it.each([
-    ['coach', { space: 'coach', questionId: null, attemptId: null }],
-    [
-      'exam_analysis',
-      { space: 'exam_analysis', questionId: null, attemptId: ATTEMPT_ID },
-    ],
-  ] as const)('never calls the AI for %s threads', async (space, overrides) => {
+  it('never calls the AI for exam_analysis threads', async () => {
     const userStored = messageRow();
     const { db, inserted } = makeDb({
-      chatThread: [[threadRow(overrides)]],
+      chatThread: [
+        [
+          threadRow({
+            space: 'exam_analysis',
+            questionId: null,
+            attemptId: ATTEMPT_ID,
+          }),
+        ],
+      ],
       chatMessage: [[userStored]],
     });
     const { chatAi, replyFn } = makeChatAi(() =>
       Promise.resolve('نباید صدا شود'),
     );
-    const service = new ChatService(db, chatAi, paidSubscription());
+    const service = new ChatService(db, chatAi, paidSub());
 
     const result = await service.addMessage(USER_ID, THREAD_ID, 'سلام');
 
@@ -527,17 +534,153 @@ describe('ChatService — AI reply pipeline (spec 9.1/9.2)', () => {
   });
 });
 
-describe('ChatService — free-plan AI quota (spec §10)', () => {
-  function makeSubscription(paid: boolean) {
-    const hasPaidPlan = jest
-      .fn<Promise<boolean>, [string]>()
-      .mockResolvedValue(paid);
+describe('ChatService — coach AI replies (spec 9.1)', () => {
+  /** Optional ChatAiService stub with a replyCoach spy. */
+  function makeCoachAi(replyCoach: () => Promise<string>) {
+    const replyCoachFn = jest.fn<Promise<string>, [unknown, string, string]>(
+      replyCoach,
+    );
     return {
-      service: { hasPaidPlan } as unknown as SubscriptionService,
-      hasPaidPlan,
+      chatAi: {
+        reply: jest.fn(() => Promise.resolve('نباید صدا شود')),
+        replyCoach: replyCoachFn,
+      } as unknown as ChatAiService,
+      replyCoachFn,
     };
   }
 
+  function coachThread(): Row {
+    return threadRow({ space: 'coach', questionId: null, attemptId: null });
+  }
+
+  it('400s a coach send without a mode and stores nothing', async () => {
+    const { db, inserted } = makeDb({ chatThread: [[coachThread()]] });
+    const { chatAi, replyCoachFn } = makeCoachAi(() =>
+      Promise.resolve('پاسخ مربی'),
+    );
+    const service = new ChatService(db, chatAi, makeSubscription(true).service);
+
+    await expect(
+      service.addMessage(USER_ID, THREAD_ID, 'حالم خوب نیست'),
+    ).rejects.toBeInstanceOf(BadRequestException);
+
+    expect(replyCoachFn).not.toHaveBeenCalled();
+    expect(inserted).toHaveLength(0);
+  });
+
+  it.each(['question', 'exam_analysis'] as const)(
+    '400s a mode on a %s thread',
+    async (space) => {
+      const { db, inserted } = makeDb({
+        chatThread: [
+          [
+            space === 'question'
+              ? threadRow()
+              : threadRow({
+                  space,
+                  questionId: null,
+                  attemptId: ATTEMPT_ID,
+                }),
+          ],
+        ],
+      });
+      const service = new ChatService(db);
+
+      await expect(
+        service.addMessage(USER_ID, THREAD_ID, 'سلام', 'motivation'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(inserted).toHaveLength(0);
+    },
+  );
+
+  it('persists the assistant row through the coach path with the mode', async () => {
+    const userStored = messageRow({ body: 'حالم خوب نیست' });
+    const assistantStored = messageRow({
+      id: 'coach-assistant',
+      role: 'assistant',
+      body: 'پاسخ مربی',
+    });
+    const { db, inserted } = makeDb({
+      chatThread: [[coachThread()]],
+      chatMessage: [[userStored], [assistantStored]],
+    });
+    const { chatAi, replyCoachFn } = makeCoachAi(() =>
+      Promise.resolve('پاسخ مربی'),
+    );
+    const service = new ChatService(db, chatAi, makeSubscription(true).service);
+
+    const result = await service.addMessage(
+      USER_ID,
+      THREAD_ID,
+      'حالم خوب نیست',
+      'motivation',
+    );
+
+    expect(result).toEqual({
+      userMessage: userStored,
+      assistantMessage: assistantStored,
+    });
+    expect(replyCoachFn).toHaveBeenCalledTimes(1);
+    expect(replyCoachFn.mock.calls[0][2]).toBe('motivation');
+    expect(inserted).toHaveLength(2);
+    expect(inserted[1].values).toEqual({
+      threadId: THREAD_ID,
+      role: 'assistant',
+      body: 'پاسخ مربی',
+    });
+  });
+
+  it('keeps the user message and reports ai_unavailable when the coach AI fails', async () => {
+    const userStored = messageRow({ body: 'حالم خوب نیست' });
+    const { db, inserted } = makeDb({
+      chatThread: [[coachThread()]],
+      chatMessage: [[userStored]],
+    });
+    const { chatAi } = makeCoachAi(() =>
+      Promise.reject(new Error('model down')),
+    );
+    const service = new ChatService(db, chatAi, makeSubscription(true).service);
+
+    const result = await service.addMessage(
+      USER_ID,
+      THREAD_ID,
+      'حالم خوب نیست',
+      'planning',
+    );
+
+    expect(result).toEqual({
+      userMessage: userStored,
+      assistantMessage: null,
+      notice: 'ai_unavailable',
+    });
+    expect(inserted).toHaveLength(1);
+  });
+
+  it('free quota still gates coach sends at the limit', async () => {
+    const { db, inserted } = makeDb({
+      appConfig: [[]], // no active row → documented default of 5
+      chatThread: [[coachThread()]],
+      chatMessage: [[{ count: 5 }]], // shared pool already full
+    });
+    const { chatAi, replyCoachFn } = makeCoachAi(() =>
+      Promise.resolve('نباید صدا شود'),
+    );
+    const service = new ChatService(
+      db,
+      chatAi,
+      makeSubscription(false).service,
+    );
+
+    await expect(
+      service.addMessage(USER_ID, THREAD_ID, 'حالم خوب نیست', 'debug'),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+
+    expect(replyCoachFn).not.toHaveBeenCalled();
+    expect(inserted).toHaveLength(0);
+  });
+});
+
+describe('ChatService — free-plan AI quota (spec §10)', () => {
   /** The shared-pool count condition (role, spaces, rolling window). */
   function countWhere(conditions: SQL[]): SQL | undefined {
     return conditions.find((condition) =>

@@ -10,12 +10,16 @@ import {
   question,
   response,
   rubric,
+  student,
+  studyLog,
 } from '../../db/schema';
 import type { ChatMessage, ChatThread } from '../../db/schema';
 import type { HistoryContext } from '../ai/history-context.service';
 import {
+  buildCoachChatPrompt,
   CHAT_HISTORY_WINDOW,
   CHAT_PROMPT_VERSION,
+  COACH_MODE_RULES,
   SEVEN_CLAUSES,
   buildQuestionChatPrompt,
   parseChatReply,
@@ -46,6 +50,8 @@ const TABLES: Record<string, unknown> = {
   correction,
   chatMessage,
   attempt,
+  student,
+  studyLog,
 };
 
 function makeDb(fixtures: Record<string, Row[][]> = {}) {
@@ -413,5 +419,147 @@ describe('buildQuestionChatPrompt / parseChatReply — pure contract', () => {
     expect(parseChatReply('  پاسخ دستیار  ')).toBe('پاسخ دستیار');
     expect(() => parseChatReply('')).toThrow();
     expect(() => parseChatReply('   ')).toThrow();
+  });
+});
+
+describe('ChatAiService — coach replies (spec 9.1)', () => {
+  const PROFILE_ROW = {
+    major: 'ریاضی',
+    grade: 'دوازدهم',
+    targetYear: 1404,
+    streak: 4,
+    studiedTopicIds: ['11111111-1111-4111-8111-111111111111'],
+  };
+
+  /** The history summary the service hands in, with one weak topic. */
+  function weakHistory(samples: string[] = []): HistoryContext {
+    return historyStub({
+      weakTopics: [weakTopic({ sampleWrongTexts: samples })],
+    });
+  }
+
+  function coachInput(overrides: {
+    mode: 'motivation' | 'planning' | 'debug';
+    activityCount7d?: number | null;
+    studyTitles?: string[] | null;
+  }) {
+    return {
+      mode: overrides.mode,
+      profile: {
+        major: PROFILE_ROW.major,
+        grade: PROFILE_ROW.grade,
+        targetYear: PROFILE_ROW.targetYear,
+        streak: PROFILE_ROW.streak,
+        studiedTopicIds: PROFILE_ROW.studiedTopicIds,
+      },
+      summary: weakHistory(
+        overrides.mode === 'debug' ? ['نمونه غلط دینامیک'] : [],
+      ),
+      activityCount7d: overrides.activityCount7d ?? null,
+      studyTitles: overrides.studyTitles ?? null,
+      history: [] as ChatMessage[],
+    };
+  }
+
+  it('sends operation coach / coach-v1 with the profile layer', async () => {
+    const { service, runJob, historyContext } = build({
+      student: [[PROFILE_ROW]],
+      studyLog: [[{ count: 1 }]], // motivation reads only a COUNT
+      chatMessage: [[messageRow({ body: 'حالم خوب نیست' })]],
+    });
+
+    const reply = await service.replyCoach(
+      threadRow({ space: 'coach', questionId: null, attemptId: null }),
+      STUDENT_ID,
+      'motivation',
+    );
+
+    expect(reply).toBe('پاسخ دستیار');
+    expect(historyContext.buildForStudent).toHaveBeenCalledWith(STUDENT_ID);
+    expect(runJob).toHaveBeenCalledTimes(1);
+    const input = runJob.mock.calls[0][0] as {
+      operation: string;
+      promptVersion: string;
+      prompt: string;
+    };
+    expect(input.operation).toBe('coach');
+    expect(input.promptVersion).toBe('coach-v1');
+
+    const prompt = input.prompt;
+    expect(prompt).toContain(SEVEN_CLAUSES);
+    expect(prompt).toContain('حالت این پاسخ: انگیزشی');
+    // Fixed layer: strand/grade/target-year + streak.
+    expect(prompt).toContain('- رشته: ریاضی');
+    expect(prompt).toContain('- پایه: دوازدهم');
+    expect(prompt).toContain('- سال هدف کنکور: 1404');
+    expect(prompt).toContain('- استریک فعلی: 4 روز');
+  });
+
+  it('motivation carries counts only — no weak-topic titles or samples', () => {
+    const prompt = buildCoachChatPrompt(
+      coachInput({ mode: 'motivation', activityCount7d: 3 }),
+    );
+
+    expect(prompt).toContain('- مجموع خطاهای اخیر: 12');
+    expect(prompt).toContain('- موضوعات نیازمند تمرین: 1 موضوع');
+    expect(prompt).toContain('- مطالعات ثبت‌شده در ۷ روز گذشته: 3 مورد');
+    // The mode's own rule line rides on top of the seven clauses.
+    expect(prompt).toContain(COACH_MODE_RULES.motivation);
+    // A pep talk dumps no data: no titles, no samples, no study titles.
+    expect(prompt).not.toContain('دینامیک');
+    expect(prompt).not.toContain('نمونه');
+    expect(prompt).not.toContain('مطالعات اخیر');
+  });
+
+  it('planning carries weak topics + studied topics + recent study titles', () => {
+    const prompt = buildCoachChatPrompt(
+      coachInput({
+        mode: 'planning',
+        studyTitles: ['حساب دیفرانسیل — حد', 'هندسه'],
+      }),
+    );
+
+    expect(prompt).toContain('حالت این پاسخ: برنامه‌ریزی');
+    expect(prompt).toContain('- دینامیک: 5 خطا');
+    expect(prompt).toContain(
+      'موضوعات مطالعه‌شده (خوداعلامی): 11111111-1111-4111-8111-111111111111',
+    );
+    expect(prompt).toContain('مطالعات اخیر (۷ روز گذشته):');
+    expect(prompt).toContain('- حساب دیفرانسیل — حد');
+    expect(prompt).toContain('- هندسه');
+    // Debug-only and motivation-only layers stay out of the planning prompt.
+    expect(prompt).not.toContain('نمونه غلط');
+    expect(prompt).not.toContain('مطالعات ثبت‌شده');
+  });
+
+  it('debug carries the weak topics’ sample wrong answers', () => {
+    const prompt = buildCoachChatPrompt(coachInput({ mode: 'debug' }));
+
+    expect(prompt).toContain('حالت این پاسخ: رفع اشکال');
+    expect(prompt).toContain('- دینامیک: 5 خطا');
+    expect(prompt).toContain('  · نمونه: نمونه غلط دینامیک');
+    // Planning-only and motivation-only layers stay out of the debug prompt.
+    expect(prompt).not.toContain('موضوعات مطالعه‌شده');
+    expect(prompt).not.toContain('مطالعات ثبت‌شده');
+  });
+
+  it('reads no study-log data outside the mode’s lazy layer', async () => {
+    // Debug needs neither the activity count nor the study titles.
+    const { service, runJob, conditions } = build({
+      student: [[PROFILE_ROW]],
+      studyLog: [[{ lesson: 'نباید خوانده شود', topic: null }]],
+      chatMessage: [[]],
+    });
+
+    await service.replyCoach(
+      threadRow({ space: 'coach', questionId: null, attemptId: null }),
+      STUDENT_ID,
+      'debug',
+    );
+
+    expect(
+      conditions.some((condition) => text(condition).includes('"study_log"')),
+    ).toBe(false);
+    expect(runJob).toHaveBeenCalledTimes(1);
   });
 });

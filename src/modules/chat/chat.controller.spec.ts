@@ -52,7 +52,7 @@ function build() {
     .fn<Promise<unknown[]>, [string, string, number?]>()
     .mockResolvedValue([]);
   const addMessage = jest
-    .fn<Promise<unknown>, [string, string, string]>()
+    .fn<Promise<unknown>, [string, string, string, string?]>()
     .mockResolvedValue({
       userMessage: { id: 'msg-1', role: 'user', body: 'سلام' },
       assistantMessage: null,
@@ -148,19 +148,41 @@ describe('ChatController — delegation', () => {
     );
   });
 
-  it('appends the caller message body to the owned thread', async () => {
+  it('appends the caller message body (and coach mode) to the owned thread', async () => {
+    const { controller, addMessage } = build();
+
+    const dto = new CreateMessageDto();
+    dto.body = 'سلام';
+    dto.mode = 'motivation';
+
+    const result = await controller.addMessage(user, THREAD_ID, dto);
+
+    expect(addMessage).toHaveBeenCalledWith(
+      USER_ID,
+      THREAD_ID,
+      'سلام',
+      'motivation',
+    );
+    expect(result).toEqual({
+      userMessage: { id: 'msg-1', role: 'user', body: 'سلام' },
+      assistantMessage: null,
+    });
+  });
+
+  it('passes no mode when the DTO omits one', async () => {
     const { controller, addMessage } = build();
 
     const dto = new CreateMessageDto();
     dto.body = 'سلام';
 
-    const result = await controller.addMessage(user, THREAD_ID, dto);
+    await controller.addMessage(user, THREAD_ID, dto);
 
-    expect(addMessage).toHaveBeenCalledWith(USER_ID, THREAD_ID, 'سلام');
-    expect(result).toEqual({
-      userMessage: { id: 'msg-1', role: 'user', body: 'سلام' },
-      assistantMessage: null,
-    });
+    expect(addMessage).toHaveBeenCalledWith(
+      USER_ID,
+      THREAD_ID,
+      'سلام',
+      undefined,
+    );
   });
 });
 
