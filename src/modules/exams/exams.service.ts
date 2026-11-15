@@ -47,6 +47,7 @@ import { StartExamDto, CountsDto } from './dto/start-exam.dto';
 import { QuestionDrafterService } from '../ai/question-drafter.service';
 import { ReferralsService } from '../referrals/referrals.service';
 import { SubscriptionService } from '../billing/subscription.service';
+import { GradingService } from '../grading/grading.service';
 // Free-quiz quota pieces shared with DashboardService (spec 10) — one source.
 import {
   FREE_QUIZ_WEEKLY_DEFAULT,
@@ -162,6 +163,7 @@ export class ExamsService {
     @Optional() private readonly drafter?: QuestionDrafterService,
     @Optional() private readonly referrals?: ReferralsService,
     @Optional() private readonly subscription?: SubscriptionService,
+    @Optional() private readonly grading?: GradingService,
   ) {}
 
   async startExam(
@@ -496,6 +498,20 @@ export class ExamsService {
       ?.catch((err: unknown) =>
         this.logger.warn(
           `[${studentId}] Referral first_exam bonus failed: ${String(
+            err instanceof Error ? err.message : err,
+          )}`,
+        ),
+      );
+
+    // AI rubric grading of the descriptive answers (spec 6): also
+    // fire-and-forget AFTER the finish transaction commits — grading never
+    // breaks the exam result, and a grading failure only leaves the
+    // correction rows at needs_review for the human reviewer.
+    void this.grading
+      ?.gradeAttempt(attemptId)
+      ?.catch((err: unknown) =>
+        this.logger.warn(
+          `[${attemptId}] AI grading trigger failed: ${String(
             err instanceof Error ? err.message : err,
           )}`,
         ),

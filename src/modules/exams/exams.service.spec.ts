@@ -3,7 +3,15 @@ import type { SQL } from 'drizzle-orm';
 import { PgDialect } from 'drizzle-orm/pg-core';
 
 import type { Db } from '../../db/db.module';
+import {
+  answerKey,
+  attempt,
+  correction,
+  response,
+  student,
+} from '../../db/schema';
 import { QuestionType } from '../questions/enums/question-type.enum';
+import type { GradingService } from '../grading/grading.service';
 import type { CountsDto, StartExamDto } from './dto/start-exam.dto';
 import { ExamsService } from './exams.service';
 
@@ -155,5 +163,219 @@ describe('ExamsService quiz_after_study selection', () => {
     for (const condition of conditions) {
       expect(dialect.sqlToQuery(condition).sql).not.toContain('topic_id');
     }
+  });
+});
+
+describe('ExamsService finishExam — AI grading trigger (spec 6)', () => {
+  const USER_ID = '3fa85f64-5717-4562-b3fc-2c963f66afa6';
+  const ATTEMPT_ID = '9d8c7b6a-5f4e-4d3c-2b1a-0f9e8d7c6b5a';
+  const Q_MCQ = '7a9b1c3d-5e7f-4a9b-8c1d-3e5f7a9b1c3d';
+  const Q_DESC = '2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e';
+
+  type Row = Record<string, unknown>;
+  const TABLES: Record<string, unknown> = {
+    student,
+    attempt,
+    response,
+    answerKey,
+    correction,
+  };
+
+  /** Table-routed mock covering the whole finish transaction. */
+  function makeFinishDb(fixtures: Record<string, Row[][]> = {}) {
+    const queues = new Map<unknown, Row[][]>();
+    for (const [name, sets] of Object.entries(fixtures)) {
+      const table = TABLES[name];
+      if (!table) throw new Error(`Unknown table fixture: ${name}`);
+      queues.set(table, [...sets]);
+    }
+
+    const conditions: SQL[] = [];
+    const updated: Array<{ table: unknown; values: Row }> = [];
+    const inserted: Array<{ table: unknown; values: Row }> = [];
+
+    const take = (table: unknown): Row[] => {
+      const queue = queues.get(table);
+      if (!queue) return [];
+      return table === student ? (queue[0] ?? []) : (queue.shift() ?? []);
+    };
+
+    const resolvable = (rows: Row[]): unknown => ({
+      then: (resolve: (value: Row[]) => void) => resolve(rows),
+      for: () => resolvable(rows), // the finish path locks the attempt row
+    });
+
+    const makeChain = (table: unknown, result: Row[]) => {
+      const chain = {
+        innerJoin() {
+          return chain;
+        },
+        where(condition: SQL) {
+          if (table !== student) conditions.push(condition);
+          return chain;
+        },
+        limit(count: number) {
+          return resolvable(result.slice(0, count));
+        },
+        then(resolve: (value: Row[]) => void) {
+          resolve(result);
+        },
+      };
+      return chain;
+    };
+
+    const select = jest.fn(() => ({
+      from: jest.fn((table: unknown) => makeChain(table, take(table))),
+    }));
+    const update = jest.fn((table: unknown) => ({
+      set: jest.fn((values: Row) => ({
+        where: jest.fn(() => {
+          updated.push({ table, values });
+          return Promise.resolve();
+        }),
+      })),
+    }));
+    const insert = jest.fn((table: unknown) => ({
+      values: jest.fn((values: Row) => ({
+        returning: jest.fn(() => {
+          inserted.push({ table, values });
+          return Promise.resolve([]);
+        }),
+        then: (resolve: (value: Row[]) => void) => {
+          inserted.push({ table, values });
+          resolve([]);
+        },
+      })),
+    }));
+
+    const tx = { select, update, insert };
+    const transaction = jest.fn((callback: (t: typeof tx) => unknown) =>
+      Promise.resolve(callback(tx)),
+    );
+    const db = { select, update, insert, transaction } as unknown as Db;
+
+    return { db, transaction, conditions, updated, inserted };
+  }
+
+  function attemptRow(): Row {
+    return {
+      id: ATTEMPT_ID,
+      status: 'in_progress',
+      startedAt: new Date(), // inside the duration window
+      submittedAt: null,
+      totalScore: null,
+      questionOrder: [Q_MCQ, Q_DESC],
+      settings: { durationSeconds: 600 },
+    };
+  }
+
+  function responseRows(): Row[] {
+    return [
+      {
+        id: 'resp-mcq',
+        questionId: Q_MCQ,
+        questionVersion: 1,
+        selectedOption: 1,
+        textAnswer: null,
+        isCorrect: null,
+      },
+      {
+        id: 'resp-desc',
+        questionId: Q_DESC,
+        questionVersion: 1,
+        selectedOption: null,
+        textAnswer: 'پاسخ تشریحی',
+        isCorrect: null,
+      },
+    ];
+  }
+
+  function makeGrading(impl: () => Promise<void>) {
+    const gradeAttempt = jest.fn<Promise<void>, [string]>(impl);
+    return {
+      service: { gradeAttempt } as unknown as GradingService,
+      gradeAttempt,
+    };
+  }
+
+  it('fires the AI grading once, after the finish transaction commits', async () => {
+    const { db, transaction, updated, inserted } = makeFinishDb({
+      student: [[{ id: STUDENT_ID }]],
+      attempt: [[attemptRow()]],
+      response: [responseRows()],
+      answerKey: [
+        [{ questionId: Q_MCQ, questionVersion: 1, correctOptionIndex: 1 }],
+      ],
+      correction: [[]], // nothing queued yet → the descriptive row is inserted
+    });
+    const { service: grading, gradeAttempt } = makeGrading(() =>
+      Promise.resolve(),
+    );
+    const service = new ExamsService(
+      db,
+      undefined,
+      undefined,
+      undefined,
+      grading,
+    );
+
+    const result = await service.finishExam(ATTEMPT_ID, USER_ID);
+
+    // The finish result is the choice score + the pending count — grading
+    // never changes it.
+    expect(result).toEqual({ totalScore: 1, pendingDescriptive: 1 });
+    expect(transaction).toHaveBeenCalledTimes(1);
+    expect(gradeAttempt).toHaveBeenCalledTimes(1);
+    expect(gradeAttempt).toHaveBeenCalledWith(ATTEMPT_ID);
+    // The finish transaction did its own writes; grading is separate.
+    expect(updated.map((u) => u.table)).toEqual([response, response, attempt]);
+    expect(inserted.map((i) => i.table)).toEqual([correction]);
+  });
+
+  it('a grading failure never breaks the exam result', async () => {
+    const { db } = makeFinishDb({
+      student: [[{ id: STUDENT_ID }]],
+      attempt: [[attemptRow()]],
+      response: [responseRows()],
+      answerKey: [
+        [{ questionId: Q_MCQ, questionVersion: 1, correctOptionIndex: 1 }],
+      ],
+      correction: [[]],
+    });
+    const { service: grading, gradeAttempt } = makeGrading(() =>
+      Promise.reject(new Error('grading down')),
+    );
+    const service = new ExamsService(
+      db,
+      undefined,
+      undefined,
+      undefined,
+      grading,
+    );
+
+    const result = await service.finishExam(ATTEMPT_ID, USER_ID);
+
+    expect(result).toEqual({ totalScore: 1, pendingDescriptive: 1 });
+    expect(gradeAttempt).toHaveBeenCalledWith(ATTEMPT_ID);
+
+    // Let the swallowed rejection settle; no unhandled rejection may surface.
+    await new Promise((resolve) => setImmediate(resolve));
+  });
+
+  it('works without a GradingService at all (optional dep)', async () => {
+    const { db } = makeFinishDb({
+      student: [[{ id: STUDENT_ID }]],
+      attempt: [[attemptRow()]],
+      response: [responseRows()],
+      answerKey: [
+        [{ questionId: Q_MCQ, questionVersion: 1, correctOptionIndex: 1 }],
+      ],
+      correction: [[]],
+    });
+    const service = new ExamsService(db);
+
+    const result = await service.finishExam(ATTEMPT_ID, USER_ID);
+
+    expect(result).toEqual({ totalScore: 1, pendingDescriptive: 1 });
   });
 });
