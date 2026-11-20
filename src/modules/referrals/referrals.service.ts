@@ -1,5 +1,5 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { and, desc, eq, inArray, isNull, or, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNull, ne, or, sql } from 'drizzle-orm';
 
 import { DB } from '../../db/db.module';
 import type { Db } from '../../db/db.module';
@@ -17,6 +17,14 @@ const REFERRAL_INVITER_BONUS_DAYS_KEY = 'referral_inviter_bonus_days';
 const REFERRAL_INVITER_BONUS_DAYS_DEFAULT = 7;
 const REFERRAL_INVITEE_BONUS_DAYS_KEY = 'referral_invitee_bonus_days';
 const REFERRAL_INVITEE_BONUS_DAYS_DEFAULT = 2;
+
+/**
+ * Monthly cap on inviter rewards (spec §11 ¶91): a per-inviter cap on
+ * rewarded referrals per rolling 30 days. The spec's rationale is
+ * "one 3-month subscription per month" — 10 is the documented default.
+ */
+const REFERRAL_INVITER_MONTHLY_CAP_KEY = 'referral_inviter_monthly_cap';
+const REFERRAL_INVITER_MONTHLY_CAP_DEFAULT = 10;
 
 const DAY_MS = 86_400_000;
 /** Plans that count as paid access; 'free' never blocks or extends. */
@@ -139,10 +147,82 @@ export class ReferralsService {
         REFERRAL_INVITEE_BONUS_DAYS_DEFAULT,
       );
 
+      // Check monthly cap on inviter rewards (spec §11 ¶91). The count
+      // excludes the current purchase: "prior rewards in the window".
+      const monthlyCap = await this.getMonthlyCap(tx);
+      const rewardedCount = await this.countInviterRewardedInWindow(
+        tx,
+        transitioned.inviterId,
+        inviteeStudentId,
+      );
+
       const now = new Date();
-      await this.grantBonus(tx, transitioned.inviterId, inviterDays, now);
+
+      // Grant inviter bonus only if under cap (spec §11 ¶91).
+      if (rewardedCount < monthlyCap) {
+        await this.grantBonus(tx, transitioned.inviterId, inviterDays, now);
+      } else {
+        this.logger.log(
+          `referral cap reached: inviter ${transitioned.inviterId} has ${rewardedCount} rewarded referrals in the last 30 days (cap: ${monthlyCap}), skipping inviter bonus`,
+        );
+      }
+
+      // Always grant invitee bonus.
       await this.grantBonus(tx, inviteeStudentId, inviteeDays, now);
     });
+  }
+
+  /**
+   * Count the inviter's ALREADY-rewarded referrals BEFORE this purchase,
+   * within the rolling 30-day window: status is 'purchased' and its
+   * updatedAt (when it transitioned to purchased) is within the last 30
+   * days. The current invitee's own row is EXCLUDED — the guarded
+   * transition above already flipped it to 'purchased' with updatedAt=now,
+   * so without the exclusion it would count itself and the cap-th purchase
+   * would be wrongly skipped. inviteeId is unique in the referral table, so
+   * excluding it removes exactly the current purchase: purchases #1..cap
+   * are rewarded and skipping starts with purchase cap+1. Reads through the
+   * given executor (inside the transaction).
+   */
+  private async countInviterRewardedInWindow(
+    executor: DbOrTx,
+    inviterId: string,
+    currentInviteeId: string,
+  ): Promise<number> {
+    const thirtyDaysAgo = new Date(Date.now() - 30 * DAY_MS);
+    const [row] = await executor
+      .select({ count: sql<number>`count(*)::int` })
+      .from(referral)
+      .where(
+        and(
+          eq(referral.inviterId, inviterId),
+          eq(referral.status, 'purchased'),
+          sql`${referral.updatedAt} >= ${thirtyDaysAgo}`,
+          // Exclude the row THIS call just transitioned (see doc comment).
+          ne(referral.inviteeId, currentInviteeId),
+        ),
+      );
+    return row?.count ?? 0;
+  }
+
+  /**
+   * Monthly cap on inviter rewards from the active app_config row.
+   * Positive integer or the documented default (10).
+   * Reads through the given executor (inside the transaction).
+   */
+  private async getMonthlyCap(executor: DbOrTx): Promise<number> {
+    const [row] = await executor
+      .select({ quotas: appConfig.quotas })
+      .from(appConfig)
+      .where(eq(appConfig.isActive, true))
+      .orderBy(desc(appConfig.version))
+      .limit(1);
+
+    const quotas = row?.quotas as Record<string, unknown> | null | undefined;
+    const value = quotas?.[REFERRAL_INVITER_MONTHLY_CAP_KEY];
+    return typeof value === 'number' && Number.isInteger(value) && value > 0
+      ? value
+      : REFERRAL_INVITER_MONTHLY_CAP_DEFAULT;
   }
 
   /**

@@ -25,6 +25,10 @@ interface MakeDbOptions {
   configRows?: Row[];
   /** Sequential results of the paid-subscription pick (one entry per call). */
   paidRowsPerCall?: Row[][];
+  /** Result of the inviter rewarded count query (count of purchased referrals in 30-day window). */
+  capCountRows?: Row[];
+  /** Active app_config row for monthly cap lookup. */
+  capConfigRows?: Row[];
   /** Error injection points. */
   failOnOp?: 'milestone' | 'transition' | 'invitee-grant';
 }
@@ -98,6 +102,8 @@ function makeDb(options: MakeDbOptions = {}) {
     }),
   });
 
+  let appConfigCallIndex = 0;
+
   const selectChain = () => ({
     from: (table: unknown) => {
       fromTables.push(table);
@@ -108,14 +114,36 @@ function makeDb(options: MakeDbOptions = {}) {
           return chain;
         },
         orderBy: () => chain,
-        limit: () =>
-          Promise.resolve(
-            table === appConfig ? (options.configRows ?? []) : pickPaid(),
-          ),
-        then: (resolve: (rows: Row[]) => void) =>
-          resolve(
-            table === appConfig ? (options.configRows ?? []) : pickPaid(),
-          ),
+        limit: () => {
+          if (table === referral) {
+            // countInviterRewardedInWindow query
+            return Promise.resolve(options.capCountRows ?? [{ count: 0 }]);
+          }
+          if (table === appConfig) {
+            // Could be getBonusDays or getMonthlyCap
+            const callIdx = appConfigCallIndex++;
+            // First two calls are getBonusDays (inviter, invitee), third is getMonthlyCap
+            if (callIdx < 2) {
+              return Promise.resolve(options.configRows ?? []);
+            }
+            return Promise.resolve(options.capConfigRows ?? []);
+          }
+          return Promise.resolve(pickPaid());
+        },
+        then: (resolve: (rows: Row[]) => void) => {
+          if (table === referral) {
+            resolve(options.capCountRows ?? [{ count: 0 }]);
+          } else if (table === appConfig) {
+            const callIdx = appConfigCallIndex - 1; // already incremented
+            if (callIdx < 2) {
+              resolve(options.configRows ?? []);
+            } else {
+              resolve(options.capConfigRows ?? []);
+            }
+          } else {
+            resolve(pickPaid());
+          }
+        },
       };
       return chain;
     },
@@ -502,5 +530,173 @@ describe('ReferralsService.onInviteePurchased — atomicity', () => {
       'insert-sub',
       'insert-sub',
     ]);
+  });
+});
+
+describe('ReferralsService.onInviteePurchased — monthly inviter cap (spec §11 ¶91)', () => {
+  it('under default cap (10): both inviter and invitee grants happen', async () => {
+    const before = beforeMs();
+    const { service, log } = build({
+      referralRows: [{ inviterId: INVITER_ID }],
+      // capCountRows defaults to [{ count: 0 }], capConfigRows defaults to [] -> default cap 10
+    });
+
+    await service.onInviteePurchased(INVITEE_ID);
+
+    // Both grants happen: inviter (7d) + invitee (2d)
+    expect(log.insertCalls).toHaveLength(2);
+    expectExpiryDelta(log.insertCalls[0].values.expiresAt as Date, before, 7);
+    expectExpiryDelta(log.insertCalls[1].values.expiresAt as Date, before, 2);
+    // Transition committed
+    expect(log.committedTxWrites).toContain('transition');
+  });
+
+  it('at cap: invitee granted, inviter skipped, referral still marked purchased', async () => {
+    const before = beforeMs();
+    const { service, log } = build({
+      referralRows: [{ inviterId: INVITER_ID }],
+      capCountRows: [{ count: 10 }], // exactly at default cap of 10
+      capConfigRows: [], // use default cap
+    });
+
+    await service.onInviteePurchased(INVITEE_ID);
+
+    // Only invitee grant happens (2d), inviter grant skipped
+    expect(log.insertCalls).toHaveLength(1);
+    expectExpiryDelta(log.insertCalls[0].values.expiresAt as Date, before, 2);
+    expect(log.insertCalls[0].values.studentId).toBe(INVITEE_ID);
+    // Transition still committed
+    expect(log.committedTxWrites).toContain('transition');
+  });
+
+  it('over cap: invitee granted, inviter skipped', async () => {
+    const before = beforeMs();
+    const { service, log } = build({
+      referralRows: [{ inviterId: INVITER_ID }],
+      capCountRows: [{ count: 15 }], // over cap
+      capConfigRows: [],
+    });
+
+    await service.onInviteePurchased(INVITEE_ID);
+
+    expect(log.insertCalls).toHaveLength(1);
+    expectExpiryDelta(log.insertCalls[0].values.expiresAt as Date, before, 2);
+    expect(log.insertCalls[0].values.studentId).toBe(INVITEE_ID);
+    expect(log.committedTxWrites).toContain('transition');
+  });
+
+  it('cap read from config: uses configured referral_inviter_monthly_cap', async () => {
+    const before = beforeMs();
+    const { service, log } = build({
+      referralRows: [{ inviterId: INVITER_ID }],
+      capCountRows: [{ count: 3 }],
+      capConfigRows: [{ quotas: { referral_inviter_monthly_cap: 5 } }], // custom cap of 5
+    });
+
+    await service.onInviteePurchased(INVITEE_ID);
+
+    // Under custom cap (3 < 5), both grants happen
+    expect(log.insertCalls).toHaveLength(2);
+    expectExpiryDelta(log.insertCalls[0].values.expiresAt as Date, before, 7);
+    expectExpiryDelta(log.insertCalls[1].values.expiresAt as Date, before, 2);
+  });
+
+  it('cap config falls back to default for invalid values', async () => {
+    const before = beforeMs();
+    const { service, log } = build({
+      referralRows: [{ inviterId: INVITER_ID }],
+      capCountRows: [{ count: 3 }],
+      capConfigRows: [
+        { quotas: { referral_inviter_monthly_cap: 'invalid' } }, // invalid -> default 10
+      ],
+    });
+
+    await service.onInviteePurchased(INVITEE_ID);
+
+    // Under default cap (3 < 10), both grants happen
+    expect(log.insertCalls).toHaveLength(2);
+    expectExpiryDelta(log.insertCalls[0].values.expiresAt as Date, before, 7);
+    expectExpiryDelta(log.insertCalls[1].values.expiresAt as Date, before, 2);
+  });
+
+  it('rolling 30-day window: purchase outside window does not count toward cap', async () => {
+    const before = beforeMs();
+    const { service, log } = build({
+      referralRows: [{ inviterId: INVITER_ID }],
+      capCountRows: [{ count: 0 }], // mock returns 0 because the old purchase is outside 30 days
+      capConfigRows: [],
+    });
+
+    await service.onInviteePurchased(INVITEE_ID);
+
+    // Count is 0 (old purchase not in window), under cap, both grants happen
+    expect(log.insertCalls).toHaveLength(2);
+    expectExpiryDelta(log.insertCalls[0].values.expiresAt as Date, before, 7);
+    expectExpiryDelta(log.insertCalls[1].values.expiresAt as Date, before, 2);
+  });
+
+  it('cap exceeded during transaction: atomicity - rollback on failure still rolls back transition', async () => {
+    const warnSpy = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => {});
+    const { service, log } = build({
+      referralRows: [{ inviterId: INVITER_ID }],
+      capCountRows: [{ count: 0 }],
+      capConfigRows: [],
+      failOnOp: 'invitee-grant', // fail on invitee grant (second grant)
+    });
+
+    // Public boundary: swallowed, resolved, never rejects.
+    await expect(
+      service.onInviteePurchased(INVITEE_ID),
+    ).resolves.toBeUndefined();
+
+    // All-or-nothing: the winning transition was rolled back with the grants.
+    expect(log.committedTxWrites).toEqual([]);
+    expect(warnSpy).toHaveBeenCalled();
+
+    warnSpy.mockRestore();
+  });
+
+  it('cap exceeded: inviter grant skipped but invitee grant still happens and transition commits', async () => {
+    const { service, log } = build({
+      referralRows: [{ inviterId: INVITER_ID }],
+      capCountRows: [{ count: 10 }], // at cap
+      capConfigRows: [],
+    });
+
+    await service.onInviteePurchased(INVITEE_ID);
+
+    // Invitee grant happens, inviter grant skipped
+    expect(log.insertCalls).toHaveLength(1);
+    expect(log.insertCalls[0].values.studentId).toBe(INVITEE_ID);
+    // Transition committed
+    expect(log.committedTxWrites).toEqual(['transition', 'insert-sub']);
+  });
+
+  it('regression: the count query excludes the current invitee row (no off-by-one)', async () => {
+    const { service, log } = build({
+      referralRows: [{ inviterId: INVITER_ID }],
+    });
+
+    await service.onInviteePurchased(INVITEE_ID);
+
+    // The count SELECT runs inside the tx from the referral table; the
+    // guarded transition above flips the current row to 'purchased' with
+    // updatedAt=now, so the count condition MUST exclude this invitee's own
+    // row — otherwise the cap-th purchase would be wrongly skipped.
+    const countCondition = log.conditions.find(
+      (c) =>
+        c.table === referral &&
+        dialect
+          .sqlToQuery(c.condition)
+          .sql.includes('"referral"."invitee_id" <>'),
+    );
+    expect(countCondition).toBeDefined();
+    const { sql: text, params } = dialect.sqlToQuery(
+      countCondition?.condition as SQL,
+    );
+    expect(text).toContain('"referral"."invitee_id" <>');
+    expect(params).toContain(INVITEE_ID);
   });
 });
