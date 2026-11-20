@@ -505,32 +505,130 @@ describe('ChatService — AI reply pipeline (spec 9.1/9.2)', () => {
     expect(inserted).toHaveLength(1);
     expect(inserted[0].values).toMatchObject({ role: 'user' });
   });
+});
 
-  it('never calls the AI for exam_analysis threads', async () => {
-    const userStored = messageRow();
+describe('ChatService — exam_analysis AI replies (spec 9.1)', () => {
+  /** Optional ChatAiService stub with a replyExamAnalysis spy. */
+  function makeExamAi(replyExamAnalysis: () => Promise<string>) {
+    const replyExamAnalysisFn = jest.fn<Promise<string>, [unknown, string]>(
+      replyExamAnalysis,
+    );
+    return {
+      chatAi: {
+        reply: jest.fn(() => Promise.resolve('نباید صدا شود')),
+        replyCoach: jest.fn(() => Promise.resolve('نباید صدا شود')),
+        replyExamAnalysis: replyExamAnalysisFn,
+      } as unknown as ChatAiService,
+      replyExamAnalysisFn,
+    };
+  }
+
+  function examThread(): Row {
+    return threadRow({
+      space: 'exam_analysis',
+      questionId: null,
+      attemptId: ATTEMPT_ID,
+    });
+  }
+
+  it('persists the assistant row through the exam_analysis path', async () => {
+    const userStored = messageRow({ body: 'کجا اشتباه کردم؟' });
+    const assistantStored = messageRow({
+      id: 'exam-assistant',
+      role: 'assistant',
+      body: 'پاسخ تحلیل',
+    });
     const { db, inserted } = makeDb({
-      chatThread: [
-        [
-          threadRow({
-            space: 'exam_analysis',
-            questionId: null,
-            attemptId: ATTEMPT_ID,
-          }),
-        ],
-      ],
+      chatThread: [[examThread()]],
+      chatMessage: [[userStored], [assistantStored]],
+    });
+    const { chatAi, replyExamAnalysisFn } = makeExamAi(() =>
+      Promise.resolve('پاسخ تحلیل'),
+    );
+    const service = new ChatService(db, chatAi, makeSubscription(true).service);
+
+    const result = await service.addMessage(
+      USER_ID,
+      THREAD_ID,
+      'کجا اشتباه کردم؟',
+    );
+
+    expect(result).toEqual({
+      userMessage: userStored,
+      assistantMessage: assistantStored,
+    });
+    expect(replyExamAnalysisFn).toHaveBeenCalledTimes(1);
+    expect(replyExamAnalysisFn.mock.calls[0][1]).toBe(STUDENT_ID);
+    expect(inserted).toHaveLength(2);
+    expect(inserted[1].values).toEqual({
+      threadId: THREAD_ID,
+      role: 'assistant',
+      body: 'پاسخ تحلیل',
+    });
+  });
+
+  it('keeps the user message and reports ai_unavailable when the analysis AI fails', async () => {
+    const userStored = messageRow({ body: 'کجا اشتباه کردم؟' });
+    const { db, inserted } = makeDb({
+      chatThread: [[examThread()]],
       chatMessage: [[userStored]],
     });
-    const { chatAi, replyFn } = makeChatAi(() =>
-      Promise.resolve('نباید صدا شود'),
+    const { chatAi } = makeExamAi(() =>
+      Promise.reject(new Error('model down')),
     );
-    const service = new ChatService(db, chatAi, paidSub());
+    const service = new ChatService(db, chatAi, makeSubscription(true).service);
+
+    const result = await service.addMessage(
+      USER_ID,
+      THREAD_ID,
+      'کجا اشتباه کردم؟',
+    );
+
+    expect(result).toEqual({
+      userMessage: userStored,
+      assistantMessage: null,
+      notice: 'ai_unavailable',
+    });
+    expect(inserted).toHaveLength(1);
+  });
+
+  it('never consults the quota on the exam_analysis path', async () => {
+    const userStored = messageRow();
+    const assistantStored = messageRow({
+      id: 'exam-assistant',
+      role: 'assistant',
+      body: 'پاسخ تحلیل',
+    });
+    // No appConfig fixture: a config read would surface as an empty count.
+    const { db, inserted, conditions } = makeDb({
+      chatThread: [[examThread()]],
+      chatMessage: [[userStored], [assistantStored]],
+    });
+    const { service: subscription, hasPaidPlan } = makeSubscription(false);
+    const { chatAi, replyExamAnalysisFn } = makeExamAi(() =>
+      Promise.resolve('پاسخ تحلیل'),
+    );
+    const service = new ChatService(db, chatAi, subscription);
 
     const result = await service.addMessage(USER_ID, THREAD_ID, 'سلام');
 
-    expect(replyFn).not.toHaveBeenCalled();
-    expect(result).toEqual({ userMessage: userStored, assistantMessage: null });
-    expect('notice' in result).toBe(false);
-    expect(inserted).toHaveLength(1);
+    // Free user, exam_analysis space: no paid-plan read, no config read,
+    // no shared-pool count — the quota simply never runs (spec §10).
+    expect(hasPaidPlan).not.toHaveBeenCalled();
+    expect(
+      conditions.some((condition) =>
+        text(condition).includes('"chat_message"."role"'),
+      ),
+    ).toBe(false);
+    expect(
+      conditions.some((condition) => text(condition).includes('"app_config"')),
+    ).toBe(false);
+    expect(result).toEqual({
+      userMessage: userStored,
+      assistantMessage: assistantStored,
+    });
+    expect(replyExamAnalysisFn).toHaveBeenCalledTimes(1);
+    expect(inserted).toHaveLength(2);
   });
 });
 
@@ -799,6 +897,11 @@ describe('ChatService — free-plan AI quota (spec §10)', () => {
 
   it('never counts or blocks exam_analysis — outside the shared pool', async () => {
     const userStored = messageRow();
+    const assistantStored = messageRow({
+      id: 'exam-assistant',
+      role: 'assistant',
+      body: 'پاسخ تحلیل',
+    });
     const { db, inserted, conditions } = makeDb({
       chatThread: [
         [
@@ -810,21 +913,26 @@ describe('ChatService — free-plan AI quota (spec §10)', () => {
         ],
       ],
       // No count set: the exam_analysis space is not quota-metered at all.
-      chatMessage: [[userStored]],
+      chatMessage: [[userStored], [assistantStored]],
     });
     const { service: subscription } = makeSubscription(false); // free user
     const service = new ChatService(
       db,
       {
         reply: jest.fn(),
+        replyCoach: jest.fn(),
+        replyExamAnalysis: jest.fn(() => Promise.resolve('پاسخ تحلیل')),
       } as unknown as ChatAiService,
       subscription,
     );
 
     const result = await service.addMessage(USER_ID, THREAD_ID, 'سلام');
 
-    expect(result).toEqual({ userMessage: userStored, assistantMessage: null });
-    expect(inserted).toHaveLength(1);
+    expect(result).toEqual({
+      userMessage: userStored,
+      assistantMessage: assistantStored,
+    });
+    expect(inserted).toHaveLength(2);
     expect(countWhere(conditions)).toBeUndefined();
   });
 

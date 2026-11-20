@@ -7,19 +7,24 @@ import {
   attempt,
   chatMessage,
   correction,
+  examInstance,
+  examTemplate,
   question,
   response,
   rubric,
   student,
   studyLog,
+  topic,
 } from '../../db/schema';
 import type { ChatMessage, ChatThread } from '../../db/schema';
 import type { HistoryContext } from '../ai/history-context.service';
 import {
   buildCoachChatPrompt,
+  buildExamAnalysisPrompt,
   CHAT_HISTORY_WINDOW,
   CHAT_PROMPT_VERSION,
   COACH_MODE_RULES,
+  EXAM_ANALYSIS_PROMPT_VERSION,
   SEVEN_CLAUSES,
   buildQuestionChatPrompt,
   parseChatReply,
@@ -52,6 +57,9 @@ const TABLES: Record<string, unknown> = {
   attempt,
   student,
   studyLog,
+  examInstance,
+  examTemplate,
+  topic,
 };
 
 function makeDb(fixtures: Record<string, Row[][]> = {}) {
@@ -70,6 +78,9 @@ function makeDb(fixtures: Record<string, Row[][]> = {}) {
   const makeChain = (table: unknown, result: Row[]) => {
     const chain = {
       innerJoin() {
+        return chain;
+      },
+      leftJoin() {
         return chain;
       },
       where(condition: SQL) {
@@ -422,6 +433,17 @@ describe('buildQuestionChatPrompt / parseChatReply — pure contract', () => {
   });
 });
 
+describe('SEVEN_CLAUSES — verbatim pin (spec 9.2, «عینا»)', () => {
+  it('equals the docx text character-for-character (clause 7 fixed)', () => {
+    expect(SEVEN_CLAUSES).toBe(
+      '۱. فقط از داده داده‌شده استفاده کن؛ حدس نزن. ۲. اگر اطلاعات کافی نیست بگو و سؤال روشن‌کننده بپرس. ۳. عدد نساز؛ اعداد داده‌شده را تکرار کن، محاسبه نکن. ۴. علت قطعی برای خطا اعلام نکن؛ احتمال بده یا بپرس. ۵. راه‌حل متفاوت با پاسخ‌نامه را خودکار غلط ندان. ۶. هر جمله تحلیلی باید به یک شاهد مشخص وصل باشد؛ کلی‌گویی ممنوع. ۷. لحن همدل ولی صادق؛ ضعف را نه بپوشان نه تحقیر کن.',
+    );
+    // ZWNJ (U+200C) positions: داده‌شده ×2, روشن‌کننده, راه‌حل, پاسخ‌نامه,
+    // کلی‌گویی — an editor stripping them must fail CI too.
+    expect((SEVEN_CLAUSES.match(/\u200C/g) ?? []).length).toBe(6);
+  });
+});
+
 describe('ChatAiService — coach replies (spec 9.1)', () => {
   const PROFILE_ROW = {
     major: 'ریاضی',
@@ -561,5 +583,148 @@ describe('ChatAiService — coach replies (spec 9.1)', () => {
       conditions.some((condition) => text(condition).includes('"study_log"')),
     ).toBe(false);
     expect(runJob).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('ChatAiService — exam_analysis replies (spec 9.1)', () => {
+  const META_ROW = {
+    status: 'reviewed',
+    totalScore: 14,
+    startedAt: new Date('2026-05-01T08:00:00.000Z'),
+    submittedAt: new Date('2026-05-01T08:45:00.000Z'),
+    examKind: 'konkur_sim',
+    examTitle: 'آزمون جامع شماره ۳',
+    // 4 questions in the frozen order; the rows below answer only 3.
+    questionOrder: ['q-1', 'q-2', 'q-3', 'q-4'],
+  };
+
+  /** THIS attempt's rows (two topics, one blank answer). */
+  const ATTEMPT_ROWS = [
+    {
+      topicTitle: 'دینامیک',
+      selectedOption: 0,
+      textAnswer: null,
+      isCorrect: false,
+      activeSeconds: 40,
+    },
+    {
+      topicTitle: 'دینامیک',
+      selectedOption: 1,
+      textAnswer: null,
+      isCorrect: true,
+      activeSeconds: 30,
+    },
+    {
+      topicTitle: 'مشتق',
+      selectedOption: 2,
+      textAnswer: null,
+      isCorrect: false,
+      activeSeconds: 25,
+    },
+    {
+      topicTitle: 'مشتق',
+      selectedOption: null,
+      textAnswer: null,
+      isCorrect: null,
+      activeSeconds: 10,
+    },
+  ];
+
+  /** A DIFFERENT attempt of the same student — must never surface. */
+  const OTHER_ATTEMPT_ROWS = [
+    {
+      topicTitle: 'هندسه',
+      selectedOption: 0,
+      textAnswer: null,
+      isCorrect: true,
+      activeSeconds: 999,
+    },
+  ];
+
+  it('sends only THIS attempt’s real numbers, breakdown and suggestions', async () => {
+    const { service, runJob, conditions } = build({
+      attempt: [[META_ROW]],
+      response: [ATTEMPT_ROWS, OTHER_ATTEMPT_ROWS],
+      chatMessage: [[]],
+    });
+
+    const reply = await service.replyExamAnalysis(threadRow(), STUDENT_ID);
+
+    expect(reply).toBe('پاسخ دستیار');
+    expect(runJob).toHaveBeenCalledTimes(1);
+    const input = runJob.mock.calls[0][0] as {
+      operation: string;
+      promptVersion: string;
+      prompt: string;
+    };
+    expect(input.operation).toBe('exam_analysis');
+    expect(input.promptVersion).toBe(EXAM_ANALYSIS_PROMPT_VERSION);
+
+    const prompt = input.prompt;
+    expect(prompt).toContain(SEVEN_CLAUSES);
+    // Attempt header — the REAL numbers only.
+    expect(prompt).toContain('- عنوان: آزمون جامع شماره ۳');
+    expect(prompt).toContain('- نوع آزمون: konkur_sim');
+    expect(prompt).toContain('- وضعیت: reviewed');
+    expect(prompt).toContain('- نمره کل: 14');
+    // 1 correct of 3 graded → 33%.
+    expect(prompt).toContain('- درصد درست از پاسخ‌های تصحیح‌شده: 33');
+    expect(prompt).toContain('- پاسخ داده‌شده: 3 سؤال');
+    expect(prompt).toContain('- سفید: 1 سؤال');
+    expect(prompt).toContain('- زمان فعال: 105 ثانیه');
+    // Per-topic breakdown rendered.
+    expect(prompt).toContain('- دینامیک: 2 سؤال — 1 درست، 1 غلط، 0 سفید');
+    expect(prompt).toContain('- مشتق: 2 سؤال — 0 درست، 1 غلط، 1 سفید');
+    // Suggestions: weakest topics of THIS attempt.
+    expect(prompt).toContain('موضوعات پیشنهادی برای تمرین');
+    expect(prompt).toContain('- دینامیک (1 خطا)');
+    expect(prompt).toContain('- مشتق (1 خطا)');
+
+    // A second attempt of the same student must NOT appear anywhere.
+    expect(prompt).not.toContain('هندسه');
+    expect(prompt).not.toContain('999');
+
+    // The reads are attempt-scoped (and the header caller-scoped too).
+    const responseWhere = conditions.find((condition) =>
+      text(condition).includes('"response"."attempt_id"'),
+    );
+    expect(responseWhere).toBeDefined();
+    expect(params(responseWhere)).toContain(ATTEMPT_ID);
+    const metaWhere = conditions.find((condition) =>
+      text(condition).includes('"attempt"."student_id"'),
+    );
+    expect(params(metaWhere)).toContain(STUDENT_ID);
+    expect(params(metaWhere)).toContain(ATTEMPT_ID);
+  });
+
+  it('still replies when the attempt header is missing (degraded)', async () => {
+    const { service, runJob } = build({
+      attempt: [[]],
+      response: [[]],
+      chatMessage: [[]],
+    });
+
+    const reply = await service.replyExamAnalysis(threadRow(), STUDENT_ID);
+
+    expect(reply).toBe('پاسخ دستیار');
+    const prompt = (runJob.mock.calls[0][0] as { prompt: string }).prompt;
+    expect(prompt).toContain(SEVEN_CLAUSES);
+    expect(prompt).toContain('مشخصات آزمون: (در دسترس نیست');
+  });
+
+  it('keeps the exam-analysis prompt builder pure — no data, no crash', () => {
+    const prompt = buildExamAnalysisPrompt({
+      meta: null,
+      topicRows: [],
+      history: [
+        messageRow({ role: 'user', body: 'اولین پیام' }),
+        messageRow({ role: 'assistant', body: 'پاسخ اول' }),
+      ],
+    });
+
+    expect(prompt).toContain(SEVEN_CLAUSES);
+    expect(prompt).toContain('دانش‌آموز: اولین پیام');
+    expect(prompt).toContain('دستیار: پاسخ اول');
+    expect(prompt).not.toContain('تفکیک موضوعی');
   });
 });

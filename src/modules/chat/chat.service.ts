@@ -212,11 +212,11 @@ export class ChatService {
 
   /**
    * Persist the caller's message, then run the AI reply pipeline for the
-   * spaces that have one (spec 9.1/9.2): question → `reply`, coach →
-   * `replyCoach(thread, studentId, mode)`; exam_analysis stays storage-only.
-   * On ANY AI failure the user message stays stored and the response carries
-   * `notice: 'ai_unavailable'` — stored data is never lost and the request
-   * never 500s (spec 15.5). Owner-only: another student's thread is a 404.
+   * space (spec 9.1/9.2): question → `reply`, coach → `replyCoach(...mode)`,
+   * exam_analysis → `replyExamAnalysis`. On ANY AI failure the user message
+   * stays stored and the response carries `notice: 'ai_unavailable'` —
+   * stored data is never lost and the request never 500s (spec 15.5).
+   * Owner-only: another student's thread is a 404.
    *
    * Mode matrix (spec 9.1): the coach composer is explicit about which of
    * the three tabs produced the send, so a coach message without `mode` is
@@ -224,12 +224,14 @@ export class ChatService {
    * read: a rejected send stores nothing.
    *
    * Free-plan quota (spec §10): coach/question sends consume the shared
-   * 5-per-7-days pool. The count and the user-message insert run in ONE
-   * transaction to narrow the concurrent-send race; a residual race remains
-   * (a strict fix would need row locking — out of MVP scope) and a
-   * double-tap retry intentionally double-counts (no client messageId yet).
-   * Paid users and exam_analysis threads are never counted, never blocked;
-   * a blocked send stores nothing and never reaches the AI.
+   * 5-per-7-days pool; the exam_analysis space is NEVER counted or blocked
+   * (no paid-plan read, no config read, no count query). The count and the
+   * user-message insert run in ONE transaction to narrow the
+   * concurrent-send race; a residual race remains (a strict fix would need
+   * row locking — out of MVP scope) and a double-tap retry intentionally
+   * double-counts (no client messageId yet). Paid users and exam_analysis
+   * threads are never blocked; a blocked send stores nothing and never
+   * reaches the AI.
    */
   async addMessage(
     userId: string,
@@ -272,7 +274,7 @@ export class ChatService {
       return created;
     });
 
-    if (!this.chatAi || thread.space === 'exam_analysis') {
+    if (!this.chatAi) {
       return { userMessage, assistantMessage: null };
     }
 
@@ -280,7 +282,9 @@ export class ChatService {
       const reply =
         thread.space === 'coach'
           ? await this.chatAi.replyCoach(thread, studentId, mode as CoachMode)
-          : await this.chatAi.reply(thread, studentId);
+          : thread.space === 'exam_analysis'
+            ? await this.chatAi.replyExamAnalysis(thread, studentId)
+            : await this.chatAi.reply(thread, studentId);
       const [assistantMessage] = await this.db
         .insert(chatMessage)
         .values({ threadId, role: 'assistant', body: reply })

@@ -8,11 +8,13 @@ import type { ChatMessage, ChatThread } from '../../db/schema/chat';
 import { answerKey } from '../../db/schema/answer-key';
 import { attempt } from '../../db/schema/attempt';
 import { correction } from '../../db/schema/correction';
+import { examInstance, examTemplate } from '../../db/schema/exam';
 import { question } from '../../db/schema/question';
 import { response } from '../../db/schema/response';
 import { rubric } from '../../db/schema/rubric';
 import { student } from '../../db/schema/student';
 import { studyLog } from '../../db/schema/study';
+import { topic } from '../../db/schema/topic';
 import { AIService } from '../ai/ai.service';
 import { HistoryContextService } from '../ai/history-context.service';
 import type { HistoryContext } from '../ai/history-context.service';
@@ -22,7 +24,7 @@ import type { HistoryContext } from '../ai/history-context.service';
  * never reworded, never split.
  */
 export const SEVEN_CLAUSES =
-  '۱. فقط از داده داده‌شده استفاده کن؛ حدس نزن. ۲. اگر اطلاعات کافی نیست بگو و سؤال روشن‌کننده بپرس. ۳. عدد نساز؛ اعداد داده‌شده را تکرار کن، محاسبه نکن. ۴. علت قطعی برای خطا اعلام نکن؛ احتمال بده یا بپرس. ۵. راه‌حل متفاوت با پاسخ‌نامه را خودکار غلط ندان. ۶. هر جمله تحلیلی باید به یک شاهد مشخص وصل باشد؛ کلی‌گویی ممنوع. ۷. لحن همدلی ولی صادق؛ ضعف را نپوشان نه تحقیر کن.';
+  '۱. فقط از داده داده‌شده استفاده کن؛ حدس نزن. ۲. اگر اطلاعات کافی نیست بگو و سؤال روشن‌کننده بپرس. ۳. عدد نساز؛ اعداد داده‌شده را تکرار کن، محاسبه نکن. ۴. علت قطعی برای خطا اعلام نکن؛ احتمال بده یا بپرس. ۵. راه‌حل متفاوت با پاسخ‌نامه را خودکار غلط ندان. ۶. هر جمله تحلیلی باید به یک شاهد مشخص وصل باشد؛ کلی‌گویی ممنوع. ۷. لحن همدل ولی صادق؛ ضعف را نه بپوشان نه تحقیر کن.';
 
 /** Prompt revision tag written to every `ai_job` row for this operation. */
 export const CHAT_PROMPT_VERSION = 'chat-v1';
@@ -39,6 +41,10 @@ export type CoachMode = (typeof COACH_MODES)[number];
 export const COACH_OPERATION = 'coach' as const;
 /** Prompt revision tag for coach replies. */
 export const COACH_PROMPT_VERSION = 'coach-v1';
+/** Operation label for exam-analysis replies (exists in `ai_operation`). */
+export const EXAM_ANALYSIS_OPERATION = 'exam_analysis' as const;
+/** Prompt revision tag for exam-analysis replies. */
+export const EXAM_ANALYSIS_PROMPT_VERSION = 'exam-analysis-v1';
 /** Persian display label per mode (used in the prompt header). */
 const COACH_MODE_LABEL: Record<CoachMode, string> = {
   motivation: 'انگیزشی',
@@ -426,12 +432,172 @@ export function buildCoachChatPrompt(input: CoachChatPromptInput): string {
   return lines.join('\n');
 }
 
+/** Attempt + exam header row for the exam-analysis prompt (one read). */
+export interface ExamAttemptMeta {
+  status: string;
+  totalScore: number | null;
+  startedAt: Date | null;
+  submittedAt: Date | null;
+  examKind: string | null;
+  examTitle: string | null;
+  /** Frozen question order of the instance — its length counts the blanks. */
+  questionOrder: unknown;
+}
+
+/** One attempt-scoped response row joined to its question's topic. */
+export interface ExamTopicRow {
+  topicTitle: string | null;
+  selectedOption: number | null;
+  textAnswer: string | null;
+  isCorrect: boolean | null;
+  activeSeconds: number;
+}
+
+/** Everything one exam-analysis reply needs, all scoped to THAT attempt. */
+export interface ExamAnalysisPromptInput {
+  meta: ExamAttemptMeta | null;
+  topicRows: ExamTopicRow[];
+  /** ONLY the last CHAT_HISTORY_WINDOW thread messages, ascending. */
+  history: ChatMessage[];
+}
+
+const hasAnswer = (row: ExamTopicRow): boolean =>
+  (row.selectedOption !== null && row.selectedOption !== undefined) ||
+  (row.textAnswer?.trim().length ?? 0) > 0;
+
 /**
- * AI side of the question-space chat (spec 9.1/9.2): assembles the lazily
+ * Build the exam-analysis chat prompt (spec 9.1): ONLY this attempt's real
+ * numbers (clause 3 — the model repeats them, never invents), the per-topic
+ * correct/wrong/blank breakdown, and the weakest topics of this attempt as
+ * suggestions. All counts are computed HERE in JS from the attempt-scoped
+ * rows; the model only repeats them. Pure and exported so the assembled
+ * prompt is testable without a model call.
+ */
+export function buildExamAnalysisPrompt(
+  input: ExamAnalysisPromptInput,
+): string {
+  const { meta, topicRows, history } = input;
+  const lines: string[] = [
+    'تو دبیر باتجربه کنکور هستی و در چتِ تحلیل آزمون به دانش‌آموز پاسخ می‌دهی.',
+    '',
+    'قواعد زیر را عینا در همه پاسخ‌ها رعایت کن:',
+    SEVEN_CLAUSES,
+    '',
+    'تمام اعداد زیر واقعی و مربوط به همین آزمون‌اند؛ هیچ عدد یا نتیجه‌ای از خودت نساز.',
+    '',
+  ];
+
+  if (!meta) {
+    lines.push(
+      'مشخصات آزمون: (در دسترس نیست؛ درباره جزئیات آزمون از دانش‌آموز بپرس.)',
+      '',
+    );
+  } else {
+    const answered = topicRows.filter(hasAnswer).length;
+    const totalQuestions = Array.isArray(meta.questionOrder)
+      ? meta.questionOrder.length
+      : null;
+    const blank =
+      totalQuestions === null ? null : Math.max(totalQuestions - answered, 0);
+    const graded = topicRows.filter(
+      (row) => row.isCorrect === true || row.isCorrect === false,
+    );
+    const correct = graded.filter((row) => row.isCorrect === true).length;
+    const totalActive = topicRows.reduce(
+      (sum, row) => sum + (row.activeSeconds ?? 0),
+      0,
+    );
+
+    lines.push('مشخصات آزمون:');
+    lines.push(`- عنوان: ${meta.examTitle ?? 'نامشخص'}`);
+    lines.push(`- نوع آزمون: ${meta.examKind ?? 'نامشخص'}`);
+    lines.push(`- وضعیت: ${meta.status}`);
+    lines.push(
+      `- شروع: ${meta.startedAt ? meta.startedAt.toISOString() : 'نامشخص'}`,
+    );
+    lines.push(
+      `- ارسال: ${meta.submittedAt ? meta.submittedAt.toISOString() : 'ارسال نشده'}`,
+    );
+    lines.push(`- نمره کل: ${meta.totalScore ?? 'هنوز محاسبه نشده'}`);
+    if (graded.length > 0) {
+      lines.push(
+        `- درصد درست از پاسخ‌های تصحیح‌شده: ${Math.round(
+          (100 * correct) / graded.length,
+        )}`,
+      );
+    }
+    lines.push(`- پاسخ داده‌شده: ${answered} سؤال`);
+    if (blank !== null) lines.push(`- سفید: ${blank} سؤال`);
+    lines.push(`- زمان فعال: ${totalActive} ثانیه`, '');
+
+    // Per-topic breakdown — grouped from THIS attempt's rows only.
+    type Acc = { total: number; correct: number; wrong: number; blank: number };
+    const byTopic = new Map<string, Acc>();
+    for (const row of topicRows) {
+      const key = row.topicTitle ?? 'موضوع نامشخص';
+      const acc = byTopic.get(key) ?? {
+        total: 0,
+        correct: 0,
+        wrong: 0,
+        blank: 0,
+      };
+      acc.total += 1;
+      if (row.isCorrect === true) acc.correct += 1;
+      else if (row.isCorrect === false) acc.wrong += 1;
+      if (!hasAnswer(row)) acc.blank += 1;
+      byTopic.set(key, acc);
+    }
+    if (byTopic.size > 0) {
+      lines.push('تفکیک موضوعی:');
+      for (const [title, acc] of byTopic) {
+        lines.push(
+          `- ${title}: ${acc.total} سؤال — ${acc.correct} درست، ${acc.wrong} غلط، ${acc.blank} سفید`,
+        );
+      }
+      lines.push('');
+      // Suggestions: this attempt's weakest topics (most wrong answers).
+      const weakest = [...byTopic.entries()]
+        .filter(([, acc]) => acc.wrong > 0)
+        .sort((a, b) => b[1].wrong - a[1].wrong)
+        .slice(0, CHAT_SUMMARY_WEAK_TOPICS);
+      if (weakest.length > 0) {
+        lines.push(
+          'موضوعات پیشنهادی برای تمرین (بیشترین خطا در همین آزمون):',
+          ...weakest.map(([title, acc]) => `- ${title} (${acc.wrong} خطا)`),
+          '',
+        );
+      }
+    }
+  }
+
+  // History window: same last-10 rule as the other chat paths, ascending.
+  if (history.length > 0) {
+    lines.push(
+      'تاریخچه گفتگو (آخرین پیام‌ها):',
+      ...history.map((message) =>
+        message.role === 'user'
+          ? `دانش‌آموز: ${message.body}`
+          : `دستیار: ${message.body}`,
+      ),
+      '',
+    );
+  }
+
+  lines.push(
+    'به آخرین پیام دانش‌آموز پاسخ بده: فقط متن فارسی پاسخ را بده؛ بدون JSON و بدون متن اضافه.',
+  );
+  return lines.join('\n');
+}
+
+/**
+ * AI side of the chat spaces (spec 9.1/9.2): question chat, coach
+ * three-mode chat, and exam-analysis chat. Each path assembles its lazily
  * scoped context layers + the trimmed history window, then runs ONE logged
- * model call (`question_chat`, `chat-v1`). Storage/quota stay outside — the
- * caller (ChatService) persists around this call and owns the failure path.
- */ @Injectable()
+ * model call with its own operation/promptVersion. Storage/quota stay
+ * outside — the caller (ChatService) persists around the call and owns the
+ * failure path.
+ */
+@Injectable()
 export class ChatAiService {
   constructor(
     @Inject(DB) private readonly db: Db,
@@ -494,6 +660,88 @@ export class ChatAiService {
       prompt,
       parse: parseChatReply,
     });
+  }
+
+  /**
+   * One AI reply for an exam_analysis thread (spec 9.1): the context is
+   * THAT attempt only (its ref was ownership-verified at thread creation,
+   * and both reads below re-scope by the caller's student id anyway).
+   * Counts and percentages are computed HERE from the attempt's real rows —
+   * the model only repeats them (clause 3). Same contract as the other
+   * paths: throws on failure; the caller owns persistence and the
+   * failure envelope. The free-plan quota never applies to this space.
+   */
+  async replyExamAnalysis(
+    thread: ChatThread,
+    studentId: string,
+  ): Promise<string> {
+    if (!thread.attemptId) {
+      // exam_analysis threads always carry an attempt (validated matrix);
+      // this guard only keeps the types honest.
+      throw new Error('exam_analysis thread without attemptId');
+    }
+
+    const meta = await this.loadAttemptMeta(thread.attemptId, studentId);
+    const topicRows = await this.loadAttemptTopicRows(thread.attemptId);
+    const history = await this.loadRecentMessages(thread.id);
+
+    const prompt = buildExamAnalysisPrompt({ meta, topicRows, history });
+
+    return this.aiService.runJob<string>({
+      operation: EXAM_ANALYSIS_OPERATION,
+      promptVersion: EXAM_ANALYSIS_PROMPT_VERSION,
+      prompt,
+      parse: parseChatReply,
+    });
+  }
+
+  /**
+   * The attempt header + exam kind/title, scoped to THIS attempt AND the
+   * caller (defense in depth, spec 15.5). `questionOrder` gives the blank
+   * count its denominator. Null when the attempt is not the caller's.
+   */
+  private async loadAttemptMeta(
+    attemptId: string,
+    studentId: string,
+  ): Promise<ExamAttemptMeta | null> {
+    const [row] = await this.db
+      .select({
+        status: attempt.status,
+        totalScore: attempt.totalScore,
+        startedAt: attempt.startedAt,
+        submittedAt: attempt.submittedAt,
+        examKind: examTemplate.kind,
+        examTitle: examTemplate.title,
+        questionOrder: examInstance.questionOrder,
+      })
+      .from(attempt)
+      .innerJoin(examInstance, eq(examInstance.id, attempt.examInstanceId))
+      .leftJoin(examTemplate, eq(examTemplate.id, examInstance.templateId))
+      .where(and(eq(attempt.id, attemptId), eq(attempt.studentId, studentId)))
+      .limit(1);
+    return row ?? null;
+  }
+
+  /**
+   * Every response of THIS attempt with its topic — correct/wrong/blank are
+   * grouped in JS from these real rows. Bounded by the attempt's own
+   * question count (one row per question, unique index), so no limit.
+   */
+  private async loadAttemptTopicRows(
+    attemptId: string,
+  ): Promise<ExamTopicRow[]> {
+    return this.db
+      .select({
+        topicTitle: topic.title,
+        selectedOption: response.selectedOption,
+        textAnswer: response.textAnswer,
+        isCorrect: response.isCorrect,
+        activeSeconds: response.activeSeconds,
+      })
+      .from(response)
+      .innerJoin(question, eq(question.id, response.questionId))
+      .leftJoin(topic, eq(topic.id, question.topicId))
+      .where(eq(response.attemptId, attemptId));
   }
 
   /** Fixed layer: strand/grade/target-year + streak + studied topics. */
