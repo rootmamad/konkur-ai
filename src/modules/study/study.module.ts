@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 
 import { StudyController } from './study.controller';
 import { StudyService } from './study.service';
+import { StudyExtractService } from './study-extract.service';
 import { WeekSummaryService } from './week-summary.service';
 
 /**
@@ -12,7 +13,7 @@ import { WeekSummaryService } from './week-summary.service';
  */
 @Module({
   controllers: [StudyController],
-  providers: [StudyService, WeekSummaryService],
+  providers: [StudyService, WeekSummaryService, StudyExtractService],
   // Exported for the dashboard's weekly-minutes card (spec §3.7).
   exports: [StudyService],
 })

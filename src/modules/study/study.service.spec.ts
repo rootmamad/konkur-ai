@@ -167,6 +167,59 @@ describe('StudyService', () => {
     expect(storedDoneAt.getTime()).toBeLessThanOrEqual(Date.now());
   });
 
+  it("a2) createStudyEntryFromChat stores the confirmed entry with source 'chat'", async () => {
+    const created = entry({ id: 'from-chat-1', source: 'chat' });
+    const { db, log } = makeDb({ inserted: [created] });
+    const service = makeService(db);
+
+    const dto: CreateStudyEntryDto = {
+      lesson: 'شیمی — استوکیومتری',
+      activity: 'exercise',
+      minutes: 40,
+      topic: 'مول',
+      exerciseCount: 8,
+      feeling: 'vague',
+      note: 'تمرین ۲ سخت بود',
+      doneAt: '2026-01-05T10:00:00.000Z',
+    };
+
+    const result = await service.createStudyEntryFromChat(USER_ID, dto);
+
+    expect(result).toBe(created);
+    // Indistinguishable from a form entry except the server-set provenance.
+    expect(log.insertedValues[0]).toMatchObject({
+      studentId: STUDENT_ID,
+      lesson: 'شیمی — استوکیومتری',
+      topic: 'مول',
+      activity: 'exercise',
+      minutes: 40,
+      exerciseCount: 8,
+      feeling: 'vague',
+      note: 'تمرین ۲ سخت بود',
+      source: 'chat',
+      status: 'pending',
+    });
+    expect((log.insertedValues[0].doneAt as Date).toISOString()).toBe(
+      '2026-01-05T10:00:00.000Z',
+    );
+
+    // A future doneAt is clamped, exactly like the form path.
+    const beforeCall = Date.now();
+    await service.createStudyEntryFromChat(USER_ID, {
+      lesson: 'فیزیک',
+      activity: 'test',
+      minutes: 5,
+      doneAt: '2999-01-01T00:00:00.000Z',
+    });
+    const clamped = log.insertedValues[1].doneAt as Date;
+    expect(clamped.getTime()).toBeGreaterThanOrEqual(beforeCall);
+    expect(clamped.getTime()).toBeLessThanOrEqual(Date.now());
+    expect(log.insertedValues[1]).toMatchObject({
+      source: 'chat',
+      status: 'pending',
+    });
+  });
+
   it("b) repeatYesterday copies yesterday's latest entry with minutes=0 and source=repeat_yesterday", async () => {
     const yesterday = entry({
       lesson: 'فیزیک',

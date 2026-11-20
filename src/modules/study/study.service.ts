@@ -102,7 +102,34 @@ export class StudyService {
     dto: CreateStudyEntryDto,
   ): Promise<StudyLog> {
     const studentId = await this.resolveStudentId(userId);
+    return this.insertEntry(studentId, dto, 'form');
+  }
 
+  /**
+   * Insert the confirmed chat-extracted entry (spec 3.6 path 1, step 2):
+   * the explicit second call AFTER the student taps confirm on the preview.
+   * The stored row is shaped exactly like a form entry — the only difference
+   * is `source: 'chat'`, set here server-side so a client can never forge
+   * provenance.
+   */
+  async createStudyEntryFromChat(
+    userId: string,
+    dto: CreateStudyEntryDto,
+  ): Promise<StudyLog> {
+    const studentId = await this.resolveStudentId(userId);
+    return this.insertEntry(studentId, dto, 'chat');
+  }
+
+  /**
+   * One insert shared by every entry path: `source` is decided by the caller
+   * (`form` | `chat`), never taken from the client, and a future `doneAt` is
+   * clamped to now instead of being rejected.
+   */
+  private async insertEntry(
+    studentId: string,
+    dto: CreateStudyEntryDto,
+    source: 'form' | 'chat',
+  ): Promise<StudyLog> {
     const now = new Date();
     const doneAt = dto.doneAt === undefined ? now : new Date(dto.doneAt);
     if (Number.isNaN(doneAt.getTime())) {
@@ -122,7 +149,7 @@ export class StudyService {
         feeling: dto.feeling ?? null,
         note: dto.note ?? null,
         doneAt: effectiveDoneAt,
-        source: 'form',
+        source,
         status: 'pending',
       })
       .returning();

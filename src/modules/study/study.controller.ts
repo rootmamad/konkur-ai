@@ -10,6 +10,7 @@ import {
   Query,
   UseGuards,
 } from '@nestjs/common';
+import { ThrottlerGuard } from '@nestjs/throttler';
 import {
   ApiBearerAuth,
   ApiOperation,
@@ -24,6 +25,8 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import type { AuthenticatedUser } from '../../common/decorators/current-user.decorator';
 import { UserRole } from '../users/enums/user-role.enum';
 import { CreateStudyEntryDto } from './dto/create-study-entry.dto';
+import { ExtractPreviewDto } from './dto/extract-preview.dto';
+import { StudyExtractService } from './study-extract.service';
 import {
   MAX_RECENT_LIMIT,
   StudyService,
@@ -42,6 +45,7 @@ export class StudyController {
   constructor(
     private readonly studyService: StudyService,
     private readonly weekSummaryService: WeekSummaryService,
+    private readonly studyExtractService: StudyExtractService,
   ) {}
 
   @Post('entries')
@@ -51,6 +55,33 @@ export class StudyController {
     @Body() body: CreateStudyEntryDto,
   ) {
     return this.studyService.createStudyEntry(user.userId, body);
+  }
+
+  // Throttled for abuse only; deliberately NOT the chat quota — spec §10
+  // names only coach + floating chat for message quotas.
+  @Post('extract-preview')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(ThrottlerGuard)
+  @ApiOperation({
+    summary:
+      'Extract a one-line study-entry preview from free text (nothing is saved)',
+  })
+  extractPreview(
+    @CurrentUser() user: AuthenticatedUser,
+    @Body() body: ExtractPreviewDto,
+  ) {
+    return this.studyExtractService.extractPreview(user.userId, body.text);
+  }
+
+  @Post('entries/from-chat')
+  @ApiOperation({
+    summary: "Confirm and store the extracted entry (source 'chat')",
+  })
+  createEntryFromChat(
+    @CurrentUser() user: AuthenticatedUser,
+    @Body() body: CreateStudyEntryDto,
+  ) {
+    return this.studyService.createStudyEntryFromChat(user.userId, body);
   }
 
   @Post('entries/repeat-yesterday')
