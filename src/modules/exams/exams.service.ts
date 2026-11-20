@@ -42,6 +42,7 @@ import { quotaUsage, subscription } from '../../db/schema/billing';
 import { appConfig } from '../../db/schema/app-config';
 import { QuestionType } from '../questions/enums/question-type.enum';
 import { StartExamDto, CountsDto } from './dto/start-exam.dto';
+import { RecommendationDto } from './dto/recommendation.dto';
 // Value import (not `import type`): design:paramtypes must carry the real
 // class for Nest to inject the optional dependency in production.
 import { QuestionDrafterService } from '../ai/question-drafter.service';
@@ -67,6 +68,7 @@ import {
   SIM_QUESTION_COUNT_KEY,
   SIM_SOURCE_MIN_YEAR,
   SIM_TOPIC_CAP,
+  SMART_MIX_DURATION_SECONDS,
 } from './exam.constants';
 
 /**
@@ -562,6 +564,134 @@ export class ExamsService {
       .where(eq(attempt.studentId, studentId))
       .orderBy(desc(attempt.startedAt))
       .limit(50);
+  }
+
+  /**
+   * Deterministic quiz recommendation (spec §3.4, §5) — pure read, no writes, no AI.
+   * Probes the student's history (mastery + answers, same probes as selectSmartMix).
+   * - Newcomer (both empty) → recommended = diagnostic (10 questions, 15 min) with newcomer flag.
+   * - Otherwise → recommended = smart_mix with default counts { easy: 2, normal: 1, hard: 0 }
+   *   and smart-mix duration (900 s).
+   * - alternatives: all 9 kinds with their titles, durations, and suggested counts.
+   */
+  async getRecommendation(userId: string): Promise<RecommendationDto> {
+    const studentId = await this.requireStudentId(userId);
+
+    // Same newcomer probes as selectSmartMix: check mastery + answers
+    const [mastery] = await this.db
+      .select({ id: questionMastery.id })
+      .from(questionMastery)
+      .where(eq(questionMastery.studentId, studentId))
+      .limit(1);
+
+    let isNewcomer = false;
+    if (!mastery) {
+      const [answer] = await this.db
+        .select({ id: response.id })
+        .from(response)
+        .innerJoin(attempt, eq(attempt.id, response.attemptId))
+        .where(eq(attempt.studentId, studentId))
+        .limit(1);
+      isNewcomer = !answer;
+    }
+
+    // Build recommended kind
+    let recommendedKind: ExamKind;
+    let recommendedTitle: string;
+    let recommendedQuestionCount: number;
+    let recommendedDurationSeconds: number;
+    let reason: string;
+    let newcomerFlag = false;
+
+    if (isNewcomer) {
+      recommendedKind = 'diagnostic';
+      recommendedTitle = KIND_TITLES.diagnostic;
+      recommendedQuestionCount = DIAGNOSTIC_QUESTION_COUNT;
+      recommendedDurationSeconds = DIAGNOSTIC_DURATION_SECONDS;
+      reason = 'Newcomer: no history yet';
+      newcomerFlag = true;
+    } else {
+      recommendedKind = 'smart_mix';
+      recommendedTitle = KIND_TITLES.smart_mix;
+      recommendedQuestionCount = 3; // easy: 2 + normal: 1 + hard: 0 = 3
+      recommendedDurationSeconds = SMART_MIX_DURATION_SECONDS;
+      reason = 'History-based mix';
+      newcomerFlag = false;
+    }
+
+    // Build alternatives for all 9 kinds
+    const allKinds: ExamKind[] = [
+      'quiz_after_study',
+      'debug_errors',
+      'due_review',
+      'speed',
+      'trap_finder',
+      'general_prep',
+      'smart_mix',
+      'diagnostic',
+      'konkur_sim',
+      'final_sim',
+    ];
+
+    const alternatives = allKinds.map((kind) => {
+      let durationSeconds: number;
+      let counts: { easy: number; normal: number; hard: number };
+
+      switch (kind) {
+        case 'diagnostic':
+          durationSeconds = DIAGNOSTIC_DURATION_SECONDS;
+          counts = { easy: 0, normal: 0, hard: 0 };
+          break;
+        case 'konkur_sim':
+          durationSeconds = KONKUR_SIM_DURATION_SECONDS;
+          counts = { easy: 0, normal: 0, hard: 0 };
+          break;
+        case 'final_sim':
+          durationSeconds = FINAL_SIM_DURATION_SECONDS;
+          counts = { easy: 0, normal: 0, hard: 0 };
+          break;
+        case 'smart_mix':
+          durationSeconds = SMART_MIX_DURATION_SECONDS;
+          counts = { easy: 2, normal: 1, hard: 0 };
+          break;
+        case 'speed':
+          // Speed duration is dynamic per question, use default as suggestion
+          durationSeconds = 300; // 5 min default for suggestion
+          counts = { easy: 2, normal: 1, hard: 0 };
+          break;
+        case 'quiz_after_study':
+        case 'debug_errors':
+        case 'due_review':
+        case 'trap_finder':
+        case 'general_prep':
+          // Default suggested counts for these kinds
+          durationSeconds = 600; // 10 min default
+          counts = { easy: 2, normal: 1, hard: 0 };
+          break;
+        default:
+          durationSeconds = 600;
+          counts = { easy: 2, normal: 1, hard: 0 };
+      }
+
+      return {
+        kind,
+        title: KIND_TITLES[kind],
+        durationSeconds,
+        counts,
+      };
+    });
+
+    return {
+      recommended: {
+        kind: recommendedKind,
+        title: recommendedTitle,
+        questionCount: recommendedQuestionCount,
+        durationSeconds: recommendedDurationSeconds,
+        reason,
+        newcomer: newcomerFlag,
+      },
+      alternatives,
+    };
   }
 
   // ---------- helpers ----------

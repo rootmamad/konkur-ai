@@ -27,6 +27,7 @@ import { ExamsService } from './exams.service';
 import { StartExamDto } from './dto/start-exam.dto';
 import { SubmitAnswerDto } from './dto/submit-answer.dto';
 import { SyncQuestionTimeDto } from './dto/sync-question-time.dto';
+import { RecommendationDto } from './dto/recommendation.dto';
 
 @ApiTags('exams')
 @ApiBearerAuth('access-token')
@@ -108,5 +109,15 @@ export class ExamsController {
   @Get()
   getUserExams(@CurrentUser() user: AuthenticatedUser) {
     return this.examsService.getUserExams(user.userId);
+  }
+
+  @Get('recommendation')
+  @ApiOperation({
+    summary: 'Get deterministic quiz recommendation for the student',
+  })
+  getRecommendation(
+    @CurrentUser() user: AuthenticatedUser,
+  ): Promise<RecommendationDto> {
+    return this.examsService.getRecommendation(user.userId);
   }
 }

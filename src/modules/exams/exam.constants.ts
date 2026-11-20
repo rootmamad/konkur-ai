@@ -28,3 +28,9 @@ export const SIM_QUESTION_COUNT_DEFAULT = { konkur: 60, final: 30 } as const;
  * topic-heavy real exam cannot crowd out the comprehensive spread.
  */
 export const SIM_TOPIC_CAP = 10;
+
+/**
+ * Default duration for smart_mix quizzes (spec §5): 15 minutes = 900 seconds.
+ * Used by the recommendation API for the non-newcomer path.
+ */
+export const SMART_MIX_DURATION_SECONDS = 15 * 60;
