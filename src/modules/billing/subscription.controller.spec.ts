@@ -1,5 +1,5 @@
 import type { ExecutionContext } from '@nestjs/common';
-import { ForbiddenException } from '@nestjs/common';
+import { ForbiddenException, RequestMethod } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 
 import { ROLES_KEY } from '../../common/decorators/roles.decorator';
@@ -8,6 +8,7 @@ import { RolesGuard } from '../../common/guards/roles.guard';
 import { UserRole } from '../users/enums/user-role.enum';
 import { SubscriptionController } from './subscription.controller';
 import type { SubscriptionService } from './subscription.service';
+import type { ReferralsService } from '../referrals/referrals.service';
 
 const USER_ID = '9f1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d';
 const STATUS = { plan: 'full', paidAccess: true, simAccess: true } as const;
@@ -28,10 +29,10 @@ function classMetadata(key: string): unknown {
   return Reflect.getMetadata(key, SubscriptionController);
 }
 
-function methodMetadata(key: string): unknown {
+function methodMetadata(method: string, key: string): unknown {
   const handler = Object.getOwnPropertyDescriptor(
     SubscriptionController.prototype,
-    'getStatus',
+    method,
   )?.value as object | undefined;
   return handler ? Reflect.getMetadata(key, handler) : undefined;
 }
@@ -44,9 +45,12 @@ describe('SubscriptionController — GET /subscription/status (spec 3.7)', () =>
         [string]
       >()
       .mockResolvedValue({ ...STATUS });
-    const controller = new SubscriptionController({
-      getStatus,
-    } as unknown as SubscriptionService);
+    const controller = new SubscriptionController(
+      {
+        getStatus,
+      } as unknown as SubscriptionService,
+      {} as unknown as ReferralsService,
+    );
 
     const result = await controller.getStatus({
       userId: USER_ID,
@@ -70,7 +74,7 @@ describe('SubscriptionController — GET /subscription/status (spec 3.7)', () =>
     ]);
 
     const controllerPath = classMetadata('path') as string;
-    const methodPath = methodMetadata('path') as string;
+    const methodPath = methodMetadata('getStatus', 'path') as string;
     expect(`${controllerPath}/${methodPath}`).toBe('subscription/status');
   });
 
@@ -92,5 +96,68 @@ describe('SubscriptionController — GET /subscription/status (spec 3.7)', () =>
     expect(() => guard.canActivate(makeContext('advisor'))).toThrow(
       ForbiddenException,
     );
+  });
+});
+
+describe('SubscriptionController — GET /subscription/wallet (spec 3.7 section 4)', () => {
+  it('both wallet routes are GET and sit behind the class guards', () => {
+    const controllerPath = classMetadata('path') as string;
+    for (const [method, route] of [
+      ['getWallet', 'wallet'],
+      ['listWalletTransactions', 'wallet/transactions'],
+    ] as const) {
+      expect(methodMetadata(method, 'path')).toBe(route);
+      expect(methodMetadata(method, 'method')).toBe(RequestMethod.GET);
+      // No route-level guard override: the class JWT + roles apply, so a
+      // non-owner (unauthenticated or another account) can never reach it.
+      expect(methodMetadata(method, '__guards__')).toBeUndefined();
+      expect(methodMetadata(method, ROLES_KEY)).toBeUndefined();
+      expect(`${controllerPath}/${route}`).toBe(`subscription/${route}`);
+    }
+  });
+
+  it('getWallet reads the caller balance only', async () => {
+    const getWalletBalance = jest
+      .fn<Promise<{ balance: string }>, [string]>()
+      .mockResolvedValue({ balance: '1250.50' });
+    const controller = new SubscriptionController(
+      {
+        getWalletBalance,
+      } as unknown as SubscriptionService,
+      {} as unknown as ReferralsService,
+    );
+
+    const result = await controller.getWallet({
+      userId: USER_ID,
+      role: UserRole.STUDENT,
+    });
+
+    expect(getWalletBalance).toHaveBeenCalledTimes(1);
+    expect(getWalletBalance).toHaveBeenCalledWith(USER_ID); // own id, never a param
+    expect(result).toEqual({ balance: '1250.50' });
+  });
+
+  it('listWalletTransactions forwards the optional limit to the service', async () => {
+    const listWalletTransactions = jest
+      .fn<Promise<unknown[]>, [string, number | undefined]>()
+      .mockResolvedValue([]);
+    const controller = new SubscriptionController(
+      {
+        listWalletTransactions,
+      } as unknown as SubscriptionService,
+      {} as unknown as ReferralsService,
+    );
+
+    await controller.listWalletTransactions({
+      userId: USER_ID,
+      role: UserRole.STUDENT,
+    });
+    expect(listWalletTransactions).toHaveBeenLastCalledWith(USER_ID, undefined);
+
+    await controller.listWalletTransactions(
+      { userId: USER_ID, role: UserRole.STUDENT },
+      '25',
+    );
+    expect(listWalletTransactions).toHaveBeenLastCalledWith(USER_ID, 25);
   });
 });
