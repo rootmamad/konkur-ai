@@ -12,6 +12,7 @@ import { DashboardModule } from './modules/dashboard/dashboard.module';
 import { SupportModule } from './modules/support/support.module';
 import { LandingModule } from './modules/landing/landing.module';
 import { ChatModule } from './modules/chat/chat.module';
+import { ConfigModule as ConfigFeatureModule } from './modules/config/config.module';
 import { DbModule } from './db/db.module';
 import { HealthModule } from './health/health.module';
 
@@ -34,6 +35,7 @@ import { HealthModule } from './health/health.module';
     SupportModule,
     LandingModule,
     ChatModule,
+    ConfigFeatureModule,
   ],
 })
 export class AppModule {}
